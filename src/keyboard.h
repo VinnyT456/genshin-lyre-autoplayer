@@ -1,3 +1,5 @@
+#pragma once
+
 #include <unordered_map>
 #include <vector>
 #include <CoreGraphics/CoreGraphics.h>
@@ -12,8 +14,7 @@ private:
     CGKeyCode getKeyCode(Key key);
 public:
     Keyboard();
-    void press(Key key);
-    void press(Key key, chrono::milliseconds);
+    void press(vector<Key> key);
     void keyDown(Key key);
     void keyUp(Key key);
 };

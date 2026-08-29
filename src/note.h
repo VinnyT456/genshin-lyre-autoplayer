@@ -1,7 +1,15 @@
+#pragma once
+
+#include <chrono>
+#include <vector>
 #include "key.h"
 
+using namespace std;
+
 struct Note {
-    Key key;
-    int duration_ms;
-    int delay_ms;
+    vector<Key> keys;
+    chrono::milliseconds timestamp;
+
+    Note(vector<Key> keys, chrono::milliseconds timestamp)
+        : keys(keys), timestamp(timestamp) {}
 };

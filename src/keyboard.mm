@@ -1,13 +1,66 @@
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 
 #include "keyboard.h"
-#include <thread>
+
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <random>
+#include <thread>
+#include <unistd.h>
 
 using namespace std;
 
-Keyboard::Keyboard() {
+namespace {
 
+thread_local mt19937 rng{random_device{}()};
+
+int human_delay_ms(double mean, double deviation, int minimum, int maximum) {
+    normal_distribution<double> dist(mean, deviation);
+    const int sampled = static_cast<int>(std::lround(dist(rng)));
+    return std::clamp(sampled, minimum, maximum);
+}
+
+void sleep_ms(int ms) {
+    if (ms > 0) {
+        this_thread::sleep_for(chrono::milliseconds(ms));
+    }
+}
+
+CGEventSourceRef event_source() {
+    static CGEventSourceRef source =
+        CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    return source;
+}
+
+NSRunningApplication* genshin_app() {
+    for (NSRunningApplication* app in NSWorkspace.sharedWorkspace.runningApplications) {
+        if ([app.localizedName isEqualToString:@"Genshin Impact"]) {
+            return app;
+        }
+    }
+    return nil;
+}
+
+void post_event(CGEventRef event) {
+    NSRunningApplication* app = genshin_app();
+    if (app == nil) {
+        CGEventPost(kCGHIDEventTap, event);
+        return;
+    }
+
+    if (!app.isActive) {
+        [app activateWithOptions:NSApplicationActivateAllWindows];
+        usleep(50000);
+    }
+
+    CGEventPostToPid(app.processIdentifier, event);
+}
+
+}  // namespace
+
+Keyboard::Keyboard() {
     keycodes[Key::Q] = 12;
     keycodes[Key::W] = 13;
     keycodes[Key::E] = 14;
@@ -34,53 +87,52 @@ Keyboard::Keyboard() {
 }
 
 void Keyboard::keyDown(Key key) {
-    CGKeyCode keyCode = keycodes.at(key);
-
-    CGEventRef keyDown =
-        CGEventCreateKeyboardEvent(
-            nullptr,
-            keyCode,
-            true
-        );
-
-    if (keyDown == nullptr) {
+    CGEventRef key_down =
+        CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), true);
+    if (key_down == nullptr) {
         return;
     }
 
-    CGEventPost(kCGHIDEventTap, keyDown);
-    CFRelease(keyDown);
+    post_event(key_down);
+    CFRelease(key_down);
 }
 
 void Keyboard::keyUp(Key key) {
-    CGKeyCode keyCode = keycodes.at(key);
-
-    CGEventRef keyUp =
-        CGEventCreateKeyboardEvent(
-            nullptr,
-            keyCode,
-            false
-        );
-
-    if (keyUp == nullptr) {
+    CGEventRef key_up =
+        CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), false);
+    if (key_up == nullptr) {
         return;
     }
 
-    CGEventPost(kCGHIDEventTap, keyUp);
-    CFRelease(keyUp);
+    post_event(key_up);
+    CFRelease(key_up);
 }
 
-void Keyboard::press(Key key) {
-    keyDown(key);
-    this_thread::sleep_for(
-        chrono::milliseconds(300)
-    );
-    keyUp(key);
-}
+void Keyboard::press(vector<Key> keys) {
+    if (keys.empty()) {
+        return;
+    }
 
-void Keyboard::press(Key key, chrono::milliseconds hold_time) {
-    keyDown(key);
-    this_thread::sleep_for(
-        chrono::milliseconds(hold_time)
-    );
-    keyUp(key);
+    // Human timing clusters around a typical value instead of treating every
+    // point in a broad range as equally likely. Keep jitter short because the
+    // playback scheduler already determines the intended note time.
+    sleep_ms(human_delay_ms(5.0, 2.5, 1, 12));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keyDown(keys[i]);
+        if (i + 1 < keys.size()) {
+            // Fingers in a chord rarely land on the exact same millisecond.
+            sleep_ms(human_delay_ms(3.0, 1.5, 1, 7));
+        }
+    }
+
+    // Most taps sit near 45 ms, with occasional shorter or longer presses.
+    sleep_ms(human_delay_ms(45.0, 10.0, 26, 72));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keyUp(keys[i]);
+        if (i + 1 < keys.size()) {
+            sleep_ms(human_delay_ms(2.5, 1.2, 1, 6));
+        }
+    }
 }

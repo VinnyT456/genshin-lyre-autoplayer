@@ -14,9 +14,9 @@ A native macOS HUD that plays the Genshin Impact lyre for you by posting keystro
 
 ### Demo
 
-https://github.com/user-attachments/assets/16cdedcf-19c6-453c-a6b5-39c97d133791
+https://github.com/user-attachments/assets/bd77c3c4-1861-40bd-bfb5-8b45bca6b689
 
-<sub>If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo.mp4</a>.</sub>
+If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo.mp4</a>.
 
 ---
 
@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/16cdedcf-19c6-453c-a6b5-39c97d133791
 
 - macOS on **Apple Silicon**
 - [PlayCover](https://playcover.io/) + Genshin Impact
-- Xcode command-line tools (`xcode-select --install`)
+- Xcode Command Line Tools (`xcode-select --install`) — provides `clang++` and the macOS SDK. Full Xcode is not required.
 - [nlohmann/json](https://github.com/nlohmann/json) — `brew install nlohmann-json`
 - **Accessibility permission** for the terminal you run it from (System Settings → Privacy & Security → Accessibility)
 

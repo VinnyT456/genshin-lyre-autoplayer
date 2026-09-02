@@ -14,6 +14,9 @@ std::string path();
 bool get_bool(const std::string& key, bool fallback);
 void set_bool(const std::string& key, bool value);
 
+std::string get_string(const std::string& key, const std::string& fallback);
+void set_string(const std::string& key, const std::string& value);
+
 std::vector<std::string> get_string_array(const std::string& key);
 void set_string_array(const std::string& key, const std::vector<std::string>& value);
 

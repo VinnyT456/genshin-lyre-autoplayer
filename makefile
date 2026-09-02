@@ -2,11 +2,13 @@ CXX = clang++
 CXXFLAGS = -std=c++20 -g -Wall -fobjc-arc
 LDFLAGS =
 FRAMEWORKS = -framework Foundation -framework AppKit -framework CoreGraphics \
-	-framework ApplicationServices -framework UniformTypeIdentifiers
+	-framework ApplicationServices -framework UniformTypeIdentifiers \
+	-framework QuartzCore
 
 TARGET = macauto.out
 SRC = src/main.mm src/PlayerWindow.mm src/keyboard.mm src/genshin.mm \
-	src/parser.cpp src/playback_controller.cpp src/settings.cpp
+	src/parser.cpp src/playback_controller.cpp src/settings.cpp \
+	src/theme.mm src/strings.mm
 
 NLOHMANN_INCLUDE ?= $(firstword $(wildcard /opt/homebrew/include /usr/local/include))
 ifneq ($(NLOHMANN_INCLUDE),)

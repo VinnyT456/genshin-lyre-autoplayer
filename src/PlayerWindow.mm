@@ -1,4 +1,5 @@
 #import "PlayerWindow.h"
+#import <QuartzCore/QuartzCore.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <algorithm>
@@ -15,11 +16,13 @@
 #include "key.h"
 #include "playback_controller.h"
 #include "settings.h"
+#include "strings.h"
+#include "theme.h"
 
 namespace {
 
-constexpr CGFloat kW = 262.0;
-constexpr CGFloat kH = 268.0;       // expanded height
+constexpr CGFloat kW = 278.0;
+constexpr CGFloat kH = 282.0;       // expanded height
 constexpr CGFloat kMiniH = 62.0;    // collapsed: header only
 // Gap from game window edges (top-right dock).
 constexpr CGFloat kTopInset = 40.0;
@@ -27,6 +30,8 @@ constexpr CGFloat kRightInset = 56.0;
 // Local settings keys (hud-settings.json next to the binary).
 constexpr const char* kSettingCollapsed = "collapsed";
 constexpr const char* kSettingAutoPause = "auto_pause_on_blur";
+constexpr const char* kSettingTheme = "theme";
+constexpr const char* kSettingLang = "language";
 
 NSString* format_time(std::chrono::milliseconds ms) {
     const auto s = ms.count() / 1000;
@@ -61,19 +66,13 @@ std::vector<Key> keys_from_label(const std::string& label) {
     return keys;
 }
 
-// --- Palette: dark game-native, warm gold accent. One accent, used sparingly.
-NSColor* gold() {
-    return [NSColor colorWithSRGBRed:0.85 green:0.71 blue:0.42 alpha:1.0];
-}
-NSColor* ink() {  // primary text: warm off-white, not pure system label
-    return [NSColor colorWithSRGBRed:0.93 green:0.91 blue:0.86 alpha:1.0];
-}
-NSColor* ink_soft() {
-    return [NSColor colorWithSRGBRed:0.93 green:0.91 blue:0.86 alpha:0.55];
-}
-NSColor* ink_faint() {
-    return [NSColor colorWithSRGBRed:0.93 green:0.91 blue:0.86 alpha:0.32];
-}
+// --- Palette: one accent used sparingly, driven by the active theme. The
+// names stay (gold/ink) for brevity though the accent may not be gold.
+NSColor* gold() { return themes::current().accent; }
+NSColor* ink() { return themes::current().ink; }
+NSColor* ink_soft() { return themes::current().ink_soft; }
+NSColor* ink_faint() { return themes::current().ink_faint; }
+NSColor* on_accent() { return themes::current().on_accent; }
 
 NSImage* symbol(NSString* name, CGFloat size, NSFontWeight weight) {
     NSImageSymbolConfiguration* config =
@@ -519,7 +518,8 @@ static const char* kNames[3][7] = {
     CGFloat oy = 0.0;
     [self layoutGridInBounds:bounds cell:&cell ox:&ox oy:&oy];
     const CGFloat gap = 6.0;
-    const CGFloat radius = cell * 0.26;
+    // Key silhouette comes from the theme: sharp crests vs halo circles.
+    const CGFloat radius = cell * themes::current().key_radius;
 
     NSColor* g = gold();
 
@@ -539,13 +539,23 @@ static const char* kNames[3][7] = {
             const BOOL preview = (lit <= 0.0) && [self isPreview:key];
 
             if (lit > 0.0) {
-                // Soft glow, then a clean gold fill. No gradient, no gloss.
-                const CGFloat spread = 4.0 * lit;
-                [[g colorWithAlphaComponent:0.28 * lit] setFill];
+                // Keep the idle face underneath so a fading key dims back into
+                // the grid instead of settling on a muddy mid-tone — the glow
+                // should read as light going out, not as paint.
+                [[themes::current().ink colorWithAlphaComponent:0.055] setFill];
+                [face fill];
+
+                // Soft outer glow, then the accent fill fading to transparent.
+                // The halo falls off faster than the fill (lit²) so a decaying
+                // key doesn't leave a hazy smear around itself. Spread and
+                // strength come from the theme: a wide holy bloom for Naberius,
+                // a tight hot flare for Ronova.
+                const CGFloat spread = themes::current().glow_spread * lit;
+                [[g colorWithAlphaComponent:themes::current().glow_strength * lit * lit] setFill];
                 [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(r, -spread, -spread)
                                                  xRadius:radius + spread
                                                  yRadius:radius + spread] fill];
-                [[g colorWithAlphaComponent:0.35 + 0.65 * lit] setFill];
+                [[g colorWithAlphaComponent:lit] setFill];
                 [face fill];
             } else if (preview) {
                 // Resting hint: the first note's keys glow faintly and breathe,
@@ -554,20 +564,29 @@ static const char* kNames[3][7] = {
                 [[g colorWithAlphaComponent:b] setFill];
                 [face fill];
                 [[g colorWithAlphaComponent:0.35] setStroke];
-                face.lineWidth = 1.0;
+                face.lineWidth = themes::current().key_stroke;
                 [face stroke];
             } else {
-                // Idle: near-invisible, just a hairline outline.
-                [[NSColor colorWithSRGBRed:1 green:1 blue:1 alpha:0.035] setFill];
+                // Idle: near-invisible fill, plus a per-theme edge. The stroke
+                // is blended toward the accent by edge_tint so a "plated" theme
+                // (Asmoday) shows its gold trim while others stay neutral.
+                [[themes::current().ink colorWithAlphaComponent:0.055] setFill];
                 [face fill];
-                [ink_faint() setStroke];
-                face.lineWidth = 1.0;
+                NSColor* edge = [ink_faint()
+                    blendedColorWithFraction:themes::current().edge_tint
+                                     ofColor:gold()];
+                [edge setStroke];
+                face.lineWidth = themes::current().key_stroke;
                 [face stroke];
             }
 
-            NSColor* text = lit > 0.35
-                ? [NSColor colorWithSRGBRed:0.12 green:0.09 blue:0.03 alpha:1.0]
-                : (preview ? [g colorWithAlphaComponent:0.75] : ink_faint());
+            // Only swap to the on-accent color while the key is bright enough to
+            // carry it; below that, blend back toward the normal label color.
+            NSColor* text = lit > 0.55
+                ? on_accent()
+                : (preview ? [g colorWithAlphaComponent:0.75]
+                           : [ink_faint() blendedColorWithFraction:lit
+                                                           ofColor:on_accent()]);
             NSDictionary* attrs = @{
                 NSFontAttributeName:
                     [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightSemibold],
@@ -659,6 +678,94 @@ static const char* kNames[3][7] = {
 }
 @end
 
+// Themed song picker: a rounded field showing the current song plus a chevron,
+// which pops a menu of the playlist on click. AppKit's NSPopUpButton draws its
+// label in a system color we can't override, which breaks light themes — this
+// draws everything itself so it always follows the palette.
+@interface SongPicker : NSView
+@property(nonatomic, copy) NSString* title;
+@property(nonatomic, strong) NSMenu* menu_;      // items supplied by the owner
+@property(nonatomic) BOOL hovering;
+@end
+
+@implementation SongPicker {
+    NSTrackingArea* _tracking;
+}
+
+- (void)setTitle:(NSString*)title { _title = [title copy]; self.needsDisplay = YES; }
+
+- (NSSize)intrinsicContentSize { return NSMakeSize(NSViewNoIntrinsicMetric, 26); }
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_tracking != nil) {
+        [self removeTrackingArea:_tracking];
+    }
+    _tracking = [[NSTrackingArea alloc]
+        initWithRect:self.bounds
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self userInfo:nil];
+    [self addTrackingArea:_tracking];
+}
+
+- (void)mouseEntered:(NSEvent*)e { _hovering = YES; self.needsDisplay = YES; }
+- (void)mouseExited:(NSEvent*)e { _hovering = NO; self.needsDisplay = YES; }
+
+- (void)mouseDown:(NSEvent*)event {
+    if (_menu_ != nil) {
+        [_menu_ popUpMenuPositioningItem:nil
+                             atLocation:NSMakePoint(0, NSHeight(self.bounds) + 2)
+                                 inView:self];
+    }
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    const NSRect b = self.bounds;
+    NSBezierPath* bg = [NSBezierPath bezierPathWithRoundedRect:b xRadius:7 yRadius:7];
+    [[themes::current().ink colorWithAlphaComponent:_hovering ? 0.12 : 0.07] setFill];
+    [bg fill];
+    [[themes::current().ink colorWithAlphaComponent:0.10] setStroke];
+    bg.lineWidth = 1.0;
+    [bg stroke];
+
+    // Chevron on the trailing edge.
+    const CGFloat cx = NSMaxX(b) - 14;
+    const CGFloat cy = NSMidY(b);
+    NSBezierPath* chev = [NSBezierPath bezierPath];
+    [chev moveToPoint:NSMakePoint(cx - 3.5, cy + 1.5)];
+    [chev lineToPoint:NSMakePoint(cx, cy - 2.0)];
+    [chev lineToPoint:NSMakePoint(cx + 3.5, cy + 1.5)];
+    chev.lineWidth = 1.6;
+    chev.lineCapStyle = NSLineCapStyleRound;
+    [ink_soft() setStroke];
+    [chev stroke];
+
+    if (_title.length == 0) {
+        return;
+    }
+    NSDictionary* attrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: ink()
+    };
+    const CGFloat maxw = b.size.width - 12 - 22;
+    NSString* text = _title;
+    NSSize size = [text sizeWithAttributes:attrs];
+    // Truncate by trimming until it fits, then add an ellipsis.
+    while (size.width > maxw && text.length > 1) {
+        text = [text substringToIndex:text.length - 1];
+        size = [[text stringByAppendingString:@"…"] sizeWithAttributes:attrs];
+    }
+    if (![text isEqualToString:_title]) {
+        text = [text stringByAppendingString:@"…"];
+        size = [text sizeWithAttributes:attrs];
+    }
+    [text drawAtPoint:NSMakePoint(10, (b.size.height - size.height) * 0.5)
+       withAttributes:attrs];
+}
+
+@end
+
 // Small status pill: a colored dot + word (playing / paused / idle). Sits by
 // the transport so the title row stays clean.
 @interface StatusPill : NSView
@@ -704,6 +811,151 @@ static const char* kNames[3][7] = {
 }
 @end
 
+// A glyph-only button with live hover + press feedback, so the transport and
+// header chrome don't read as dead icons. Two styles:
+//   chrome    — a soft rounded pad fades in behind the glyph on hover.
+//   transport — an accent glow ring blooms behind the glyph on hover, matching
+//               the key-grid's light language; `emphasis` makes it the hero
+//               (used by play/pause) with a wider, warmer bloom.
+// Both dip slightly on press so a click feels physical.
+typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
+    GlyphButtonStyleChrome,
+    GlyphButtonStyleTransport,
+};
+
+@interface GlyphButton : NSButton
+@property(nonatomic) GlyphButtonStyle glyphStyle;
+@property(nonatomic) BOOL emphasis;   // hero treatment (play/pause)
+@end
+
+@implementation GlyphButton {
+    NSTrackingArea* _tracking;
+    double _hover;    // 0→1 eased hover amount
+    double _press;    // 0→1 eased press amount
+    BOOL _hovering;
+    BOOL _pressed;
+    NSTimer* _anim;
+}
+
+- (BOOL)wantsUpdateLayer { return NO; }
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_tracking != nil) {
+        [self removeTrackingArea:_tracking];
+    }
+    _tracking = [[NSTrackingArea alloc]
+        initWithRect:self.bounds
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self userInfo:nil];
+    [self addTrackingArea:_tracking];
+}
+
+- (void)startAnim {
+    if (_anim != nil) {
+        return;
+    }
+    _anim = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60.0
+                                             target:self
+                                           selector:@selector(stepAnim)
+                                           userInfo:nil
+                                            repeats:YES];
+}
+
+- (void)stepAnim {
+    const double hoverTarget = (_hovering && self.enabled) ? 1.0 : 0.0;
+    const double pressTarget = _pressed ? 1.0 : 0.0;
+    // Asymmetric easing: quick to light, slower to fade — reads as responsive.
+    const double up = 0.28, down = 0.16;
+    _hover += (hoverTarget - _hover) * (hoverTarget > _hover ? up : down);
+    _press += (pressTarget - _press) * (pressTarget > _press ? 0.5 : 0.3);
+    if (std::abs(_hover - hoverTarget) < 0.003) _hover = hoverTarget;
+    if (std::abs(_press - pressTarget) < 0.003) _press = pressTarget;
+    self.needsDisplay = YES;
+    if (_hover == hoverTarget && _press == pressTarget) {
+        [_anim invalidate];
+        _anim = nil;
+    }
+}
+
+- (void)mouseEntered:(NSEvent*)e { _hovering = YES; [self startAnim]; }
+- (void)mouseExited:(NSEvent*)e { _hovering = NO; [self startAnim]; }
+
+- (void)mouseDown:(NSEvent*)event {
+    if (!self.enabled) {
+        return;
+    }
+    _pressed = YES;
+    [self startAnim];
+    // Track the drag so releasing outside the button cancels the click, like a
+    // real AppKit button.
+    BOOL inside = YES;
+    NSEvent* e = event;
+    while (e.type != NSEventTypeLeftMouseUp) {
+        e = [self.window nextEventMatchingMask:
+                NSEventMaskLeftMouseUp | NSEventMaskLeftMouseDragged];
+        const NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+        inside = NSPointInRect(p, self.bounds);
+        if ((inside ? 1 : 0) != (_pressed ? 1 : 0)) {
+            _pressed = inside;
+            [self startAnim];
+        }
+    }
+    _pressed = NO;
+    [self startAnim];
+    if (inside) {
+        [self sendAction:self.action to:self.target];
+    }
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    const NSRect b = self.bounds;
+    const CGFloat cx = NSMidX(b), cy = NSMidY(b);
+    NSColor* accent = gold();
+
+    if (_glyphStyle == GlyphButtonStyleChrome) {
+        // Soft rounded pad behind the glyph.
+        if (_hover > 0.001) {
+            const CGFloat inset = 1.5;
+            NSRect pad = NSInsetRect(b, inset, inset);
+            [[ink() colorWithAlphaComponent:0.10 * _hover] setFill];
+            [[NSBezierPath bezierPathWithRoundedRect:pad xRadius:5 yRadius:5] fill];
+        }
+    } else {
+        // Transport: an accent glow ring blooms on hover.
+        const double h = _hover;
+        if (h > 0.001) {
+            const CGFloat baseR = std::min(b.size.width, b.size.height) * 0.5;
+            const CGFloat r = baseR * (_emphasis ? 1.0 : 0.92);
+            const CGFloat spread = (_emphasis ? 6.0 : 4.0) * h;
+            [[accent colorWithAlphaComponent:(_emphasis ? 0.22 : 0.16) * h] setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:
+                NSMakeRect(cx - r - spread, cy - r - spread,
+                           (r + spread) * 2, (r + spread) * 2)] fill];
+            [[ink() colorWithAlphaComponent:0.08 * h] setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:
+                NSMakeRect(cx - r, cy - r, r * 2, r * 2)] fill];
+        }
+    }
+
+    // Press dip: scale the glyph down a touch around center.
+    const CGFloat scale = 1.0 - 0.10 * _press;
+    NSImage* img = self.image;
+    if (img == nil) {
+        return;
+    }
+    const NSSize s = img.size;
+    const CGFloat w = s.width * scale, hgt = s.height * scale;
+    const CGFloat a = self.enabled ? (0.85 + 0.15 * _hover) : 0.4;
+    [img drawInRect:NSMakeRect(cx - w * 0.5, cy - hgt * 0.5, w, hgt)
+           fromRect:NSZeroRect
+          operation:NSCompositingOperationSourceOver
+           fraction:a];
+}
+
+@end
+
 @interface PlayerWindowController () <PanelMouseDelegate>
 @end
 
@@ -730,7 +982,7 @@ static const char* kNames[3][7] = {
     NSButton* _openButton;
     NSButton* _addButton;
     NSStackView* _libraryRow;
-    NSPopUpButton* _songPicker;
+    SongPicker* _songPicker;
     NSButton* _collapseButton;
     NSStackView* _controls;
     NSButton* _speedButton;
@@ -753,6 +1005,10 @@ static const char* kNames[3][7] = {
 
     BOOL _autoPauseOnBlur;         // auto-pause when Genshin loses focus
     BOOL _wasFocused;              // edge-detect focus loss
+    BOOL _openPanelActive;         // keep HUD up while the file picker is open
+    NSView* _tintView;            // panel background tint (re-colored on theme change)
+    NSButton* _hideButton;        // × close button (kept for localization)
+    NSButton* _settingsButton;    // gear — opens the same menu as right-click
 }
 
 - (instancetype)initWithPlayback:(PlaybackController*)playback
@@ -783,6 +1039,12 @@ static const char* kNames[3][7] = {
     // Auto-pause defaults ON (first launch has no stored value).
     _autoPauseOnBlur = settings::get_bool(kSettingAutoPause, true);
     _wasFocused = NO;
+
+    // Restore theme + language before building the UI so colors and strings are
+    // correct from the first frame.
+    themes::set_current(settings::get_string(kSettingTheme, "naberius"));
+    strings::set_current(settings::get_string(kSettingLang, "en") == "zh"
+        ? Lang::chinese : Lang::english);
 
     _playback->set_countdown(std::chrono::milliseconds(3000));
 
@@ -816,16 +1078,14 @@ static const char* kNames[3][7] = {
     _panel.layer.cornerRadius = 16.0;
     _panel.layer.masksToBounds = YES;
     _panel.layer.borderWidth = 1.0;
-    _panel.layer.borderColor = [NSColor colorWithSRGBRed:0.85 green:0.71 blue:0.42
-                                                   alpha:0.14].CGColor;
+    _panel.layer.borderColor = themes::current().border.CGColor;
 
-    // Tint the blur toward a warm-dark game tone.
-    NSView* tint = [[NSView alloc] initWithFrame:_panel.bounds];
-    tint.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    tint.wantsLayer = YES;
-    tint.layer.backgroundColor =
-        [NSColor colorWithSRGBRed:0.06 green:0.06 blue:0.08 alpha:0.55].CGColor;
-    [_panel addSubview:tint];
+    // Tint the blur toward the theme's dark ground tone.
+    _tintView = [[NSView alloc] initWithFrame:_panel.bounds];
+    _tintView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _tintView.wantsLayer = YES;
+    _tintView.layer.backgroundColor = themes::current().panel_tint.CGColor;
+    [_panel addSubview:_tintView];
 
     // ---- Header: title, meta, chevron, close. No badge, no glow. ----
     _titleLabel = [NSTextField labelWithString:title ?: @"Untitled"];
@@ -841,13 +1101,15 @@ static const char* kNames[3][7] = {
 
     // Add-song button lives in the header chrome once a playlist exists.
     _addButton = [self chromeButton:@"plus" action:@selector(openSongs:)
-                            tooltip:@"Add songs"];
+                            tooltip:strings::get(Str::tip_add)];
     _addButton.hidden = YES;
+    _settingsButton = [self chromeButton:@"gearshape.fill" action:@selector(showSettingsMenu:)
+                                 tooltip:strings::get(Str::tip_settings)];
     _collapseButton = [self chromeButton:@"chevron.up" action:@selector(toggleCollapse)
-                                 tooltip:@"Collapse / expand"];
-    NSButton* hide = [self chromeButton:@"xmark" action:@selector(hideHud)
-                                tooltip:@"Close and stop"];
-    hide.accessibilityLabel = @"Close HUD and stop playback";
+                                 tooltip:strings::get(Str::tip_collapse)];
+    _hideButton = [self chromeButton:@"xmark" action:@selector(hideHud)
+                             tooltip:strings::get(Str::tip_close)];
+    NSButton* hide = _hideButton;
 
     NSStackView* title_col = [NSStackView stackViewWithViews:@[_titleLabel, _metaLabel]];
     title_col.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -855,7 +1117,7 @@ static const char* kNames[3][7] = {
     title_col.alignment = NSLayoutAttributeLeading;
 
     NSStackView* chrome = [NSStackView stackViewWithViews:@[
-        _addButton, _collapseButton, hide]];
+        _addButton, _settingsButton, _collapseButton, hide]];
     chrome.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     chrome.spacing = 6;
     chrome.alignment = NSLayoutAttributeCenterY;
@@ -882,19 +1144,18 @@ static const char* kNames[3][7] = {
 
     // Library row: a big "Open songs…" when empty; the playlist picker once
     // loaded (adding more happens via the header +).
-    _openButton = [NSButton buttonWithTitle:@"Open songs…"
+    _openButton = [NSButton buttonWithTitle:strings::get(Str::open_songs)
                                      target:self
                                      action:@selector(openSongs:)];
-    _openButton.bezelStyle = NSBezelStyleRounded;
+    _openButton.bezelStyle = NSBezelStyleInline;
+    _openButton.bordered = NO;
     _openButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     _openButton.contentTintColor = gold();
-    _openButton.toolTip = @"Add .genshinsheet files or folders";
+    _openButton.toolTip = strings::get(Str::tip_add);
+    [self styleOpenButton];
 
-    _songPicker = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-    _songPicker.font = [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium];
-    _songPicker.toolTip = @"Playlist";
-    _songPicker.target = self;
-    _songPicker.action = @selector(songPickerChanged:);
+    _songPicker = [[SongPicker alloc] initWithFrame:NSZeroRect];
+    _songPicker.toolTip = strings::get(Str::tip_playlist);
     _songPicker.hidden = YES;
 
     _libraryRow = [NSStackView stackViewWithViews:@[_openButton, _songPicker]];
@@ -950,22 +1211,22 @@ static const char* kNames[3][7] = {
     _speedButton.bezelStyle = NSBezelStyleInline;
     _speedButton.bordered = NO;
     _speedButton.font = [NSFont monospacedDigitSystemFontOfSize:9.5 weight:NSFontWeightSemibold];
-    _speedButton.toolTip = @"Playback speed — click to cycle, scroll to fine-tune";
+    _speedButton.toolTip = strings::get(Str::tip_speed);
     _speedButton.contentTintColor = ink_soft();
     [_speedButton.widthAnchor constraintGreaterThanOrEqualToConstant:42].active = YES;
 
     // ---- Transport: flat, quiet. Play is a gold glyph, no disc/ring. ----
     _prevButton = [self transportButton:@"backward.fill" size:12 gold:NO
-                                 action:@selector(previousSong) tooltip:@"Previous"];
+                                 action:@selector(previousSong) tooltip:strings::get(Str::tip_previous)];
     _prevButton.hidden = YES;
     _loopButton = [self transportButton:@"repeat" size:12 gold:NO
-                                 action:@selector(toggleLoop) tooltip:@"Loop"];
+                                 action:@selector(toggleLoop) tooltip:strings::get(Str::tip_loop)];
     _playPause = [self transportButton:@"play.fill" size:18 gold:YES
-                                action:@selector(togglePlayPause:) tooltip:@"Play / Pause"];
+                                action:@selector(togglePlayPause:) tooltip:strings::get(Str::tip_playpause)];
     _stopButton = [self transportButton:@"stop.fill" size:12 gold:NO
-                                 action:@selector(stopPlayback:) tooltip:@"Stop"];
+                                 action:@selector(stopPlayback:) tooltip:strings::get(Str::tip_stop)];
     _nextButton = [self transportButton:@"forward.fill" size:12 gold:NO
-                                 action:@selector(nextSong) tooltip:@"Next"];
+                                 action:@selector(nextSong) tooltip:strings::get(Str::tip_next)];
     _nextButton.hidden = YES;
 
     _controls = [NSStackView stackViewWithViews:@[
@@ -1080,25 +1341,35 @@ static const char* kNames[3][7] = {
 #pragma mark - Small builders
 
 - (NSButton*)chromeButton:(NSString*)name action:(SEL)action tooltip:(NSString*)tip {
-    NSButton* b = [NSButton buttonWithImage:tinted_symbol(name, 10, NSFontWeightSemibold, ink_soft())
-                                     target:self action:action];
+    GlyphButton* b = [GlyphButton buttonWithImage:tinted_symbol(name, 10, NSFontWeightSemibold, ink_soft())
+                                           target:self action:action];
+    b.glyphStyle = GlyphButtonStyleChrome;
     b.bezelStyle = NSBezelStyleInline;
     b.bordered = NO;
     b.imagePosition = NSImageOnly;
     b.toolTip = tip;
+    // Give the hover pad a bit of room around the small glyph.
+    [b.widthAnchor constraintEqualToConstant:22].active = YES;
+    [b.heightAnchor constraintEqualToConstant:22].active = YES;
     return b;
 }
 
 - (NSButton*)transportButton:(NSString*)name size:(CGFloat)size gold:(BOOL)isGold
                       action:(SEL)action tooltip:(NSString*)tip {
     NSColor* color = isGold ? gold() : ink_soft();
-    NSButton* b = [NSButton buttonWithImage:tinted_symbol(name, size, NSFontWeightMedium, color)
-                                     target:self action:action];
+    GlyphButton* b = [GlyphButton buttonWithImage:tinted_symbol(name, size, NSFontWeightMedium, color)
+                                           target:self action:action];
+    b.glyphStyle = GlyphButtonStyleTransport;
+    b.emphasis = isGold;   // play/pause is the hero
     b.bezelStyle = NSBezelStyleInline;
     b.bordered = NO;
     b.imagePosition = NSImageOnly;
     b.toolTip = tip;
     b.accessibilityLabel = tip;
+    // Room for the hover glow ring; the play glyph gets a larger hit target.
+    const CGFloat side = isGold ? 34 : 28;
+    [b.widthAnchor constraintEqualToConstant:side].active = YES;
+    [b.heightAnchor constraintEqualToConstant:side].active = YES;
     return b;
 }
 
@@ -1186,24 +1457,151 @@ static const char* kNames[3][7] = {
 
 - (NSMenu*)panelContextMenu {
     NSMenu* menu = [[NSMenu alloc] init];
-    NSMenuItem* ap = [[NSMenuItem alloc] initWithTitle:@"Auto-pause when Genshin loses focus"
+
+    NSMenuItem* ap = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_autopause)
                                                 action:@selector(toggleAutoPause:)
                                          keyEquivalent:@""];
     ap.target = self;
     ap.state = _autoPauseOnBlur ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:ap];
 
-    NSMenuItem* reset = [[NSMenuItem alloc] initWithTitle:@"Reset speed to 1×"
+    NSMenuItem* reset = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_reset_speed)
                                                    action:@selector(resetSpeed:)
                                             keyEquivalent:@""];
     reset.target = self;
     [menu addItem:reset];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // Theme submenu — one item per registered theme, current one checked.
+    NSMenuItem* themeItem = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_theme)
+                                                       action:nil keyEquivalent:@""];
+    NSMenu* themeMenu = [[NSMenu alloc] init];
+    const std::string curTheme = themes::current().id;
+    const BOOL zhThemes = strings::current() == Lang::chinese;
+    for (const Theme& t : themes::all()) {
+        const std::string& label = (zhThemes && !t.name_zh.empty()) ? t.name_zh : t.name;
+        NSMenuItem* it = [[NSMenuItem alloc]
+            initWithTitle:[NSString stringWithUTF8String:label.c_str()]
+                   action:@selector(selectTheme:) keyEquivalent:@""];
+        it.target = self;
+        it.representedObject = [NSString stringWithUTF8String:t.id.c_str()];
+        it.state = (t.id == curTheme) ? NSControlStateValueOn : NSControlStateValueOff;
+        [themeMenu addItem:it];
+    }
+    themeItem.submenu = themeMenu;
+    [menu addItem:themeItem];
+
+    // Language submenu.
+    NSMenuItem* langItem = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_language)
+                                                      action:nil keyEquivalent:@""];
+    NSMenu* langMenu = [[NSMenu alloc] init];
+    const BOOL zh = strings::current() == Lang::chinese;
+    NSMenuItem* en = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_lang_english)
+                                                action:@selector(selectLanguage:) keyEquivalent:@""];
+    en.target = self; en.representedObject = @"en";
+    en.state = zh ? NSControlStateValueOff : NSControlStateValueOn;
+    [langMenu addItem:en];
+    NSMenuItem* cn = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_lang_chinese)
+                                                action:@selector(selectLanguage:) keyEquivalent:@""];
+    cn.target = self; cn.representedObject = @"zh";
+    cn.state = zh ? NSControlStateValueOn : NSControlStateValueOff;
+    [langMenu addItem:cn];
+    langItem.submenu = langMenu;
+    [menu addItem:langItem];
+
     return menu;
 }
 
 - (void)resetSpeed:(id)sender {
     _playback->set_speed(1.0);
     [self refresh];
+}
+
+// Gear button — pops the same menu the right-click gesture shows, anchored
+// just under the button.
+- (void)showSettingsMenu:(id)sender {
+    NSButton* button = _settingsButton;
+    NSMenu* menu = [self panelContextMenu];
+    const NSPoint origin = NSMakePoint(0, NSHeight(button.bounds) + 4);
+    [menu popUpMenuPositioningItem:nil atLocation:origin inView:button];
+}
+
+- (void)selectTheme:(NSMenuItem*)sender {
+    NSString* id = sender.representedObject;
+    if (id == nil) {
+        return;
+    }
+    themes::set_current(id.UTF8String);
+    settings::set_string(kSettingTheme, id.UTF8String);
+    [self applyTheme];
+}
+
+- (void)selectLanguage:(NSMenuItem*)sender {
+    NSString* code = sender.representedObject;
+    if (code == nil) {
+        return;
+    }
+    strings::set_current([code isEqualToString:@"zh"] ? Lang::chinese : Lang::english);
+    settings::set_string(kSettingLang, code.UTF8String);
+    [self applyLocalization];
+}
+
+// The "Open songs…" label is drawn by AppKit in a system color, which is
+// unreadable on a light theme — give it an explicit themed attributed title.
+- (void)styleOpenButton {
+    NSMutableParagraphStyle* p = [[NSMutableParagraphStyle alloc] init];
+    p.alignment = NSTextAlignmentCenter;
+    _openButton.attributedTitle = [[NSAttributedString alloc]
+        initWithString:strings::get(Str::open_songs)
+            attributes:@{
+                NSFontAttributeName: [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold],
+                NSForegroundColorAttributeName: gold(),
+                NSParagraphStyleAttributeName: p,
+            }];
+}
+
+// Re-color everything that caches a theme color, then force a redraw.
+- (void)applyTheme {
+    [self styleOpenButton];
+    _panel.layer.borderColor = themes::current().border.CGColor;
+    _tintView.layer.backgroundColor = themes::current().panel_tint.CGColor;
+    _titleLabel.textColor = ink();
+    _metaLabel.textColor = ink_soft();
+    _time.textColor = ink_soft();
+    _duration.textColor = ink_faint();
+    _openButton.contentTintColor = gold();
+    // Re-tint the header chrome glyphs.
+    _addButton.image = tinted_symbol(@"plus", 10, NSFontWeightSemibold, ink_soft());
+    _settingsButton.image = tinted_symbol(@"gearshape.fill", 10, NSFontWeightSemibold, ink_soft());
+    _collapseButton.image = tinted_symbol(_collapsed ? @"chevron.down" : @"chevron.up",
+                                          10, NSFontWeightSemibold, ink_soft());
+    _hideButton.image = tinted_symbol(@"xmark", 10, NSFontWeightSemibold, ink_soft());
+    _key_grid.needsDisplay = YES;
+    _progress.needsDisplay = YES;
+    _miniProgress.needsDisplay = YES;
+    [_statusPill setNeedsDisplay:YES];
+    [self reloadQueuePicker];  // re-colors the popup's item titles
+    [self refresh];  // re-applies accent-driven button glyphs + status
+}
+
+// Re-string every static label/tooltip after a language change.
+- (void)applyLocalization {
+    _addButton.toolTip = strings::get(Str::tip_add);
+    _settingsButton.toolTip = strings::get(Str::tip_settings);
+    _collapseButton.toolTip = strings::get(Str::tip_collapse);
+    _hideButton.toolTip = strings::get(Str::tip_close);
+    [self styleOpenButton];
+    _openButton.toolTip = strings::get(Str::tip_add);
+    _songPicker.toolTip = strings::get(Str::tip_playlist);
+    _prevButton.toolTip = strings::get(Str::tip_previous);
+    _loopButton.toolTip = strings::get(Str::tip_loop);
+    _playPause.toolTip = strings::get(Str::tip_playpause);
+    _stopButton.toolTip = strings::get(Str::tip_stop);
+    _nextButton.toolTip = strings::get(Str::tip_next);
+    _speedButton.toolTip = strings::get(Str::tip_speed);
+    [self reloadQueueMetadata];  // title/meta strings
+    [self refresh];              // status/hint strings
 }
 
 - (void)handleGlobalKey:(NSEvent*)event {
@@ -1237,7 +1635,6 @@ static const char* kNames[3][7] = {
 
 - (void)reloadQueuePicker {
     id<PlayerQueueDelegate> q = self.queueDelegate;
-    [_songPicker removeAllItems];
     const NSInteger count = q != nil ? [q queueCount] : 0;
 
     // Empty → big "Open songs…" button. Loaded → playlist picker + header "+".
@@ -1250,18 +1647,35 @@ static const char* kNames[3][7] = {
     _prevButton.hidden = count <= 1;
     _nextButton.hidden = count <= 1;
     if (!loaded) {
+        _songPicker.title = @"";
+        _songPicker.menu_ = nil;
         return;
     }
-    for (NSInteger i = 0; i < count; ++i) {
-        [_songPicker addItemWithTitle:[q queueTitleAtIndex:i]];
-    }
+
     NSInteger idx = [q queueCurrentIndex];
     if (idx < 0) {
         idx = 0;
     }
-    if (idx < count) {
-        [_songPicker selectItemAtIndex:idx];
+
+    // Build the playlist menu; the current song is checked.
+    NSMenu* menu = [[NSMenu alloc] init];
+    for (NSInteger i = 0; i < count; ++i) {
+        NSString* t = [q queueTitleAtIndex:i] ?: @"";
+        NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:t
+                                                      action:@selector(songMenuPicked:)
+                                               keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        item.state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu addItem:item];
     }
+    _songPicker.menu_ = menu;
+    _songPicker.title = (idx < count) ? ([q queueTitleAtIndex:idx] ?: @"") : @"";
+    _songPicker.needsDisplay = YES;
+}
+
+- (void)songMenuPicked:(NSMenuItem*)sender {
+    [self loadQueueIndex:sender.tag autoplay:NO];
 }
 
 - (void)reloadQueueMetadata {
@@ -1271,23 +1685,25 @@ static const char* kNames[3][7] = {
     }
     const NSInteger count = [q queueCount];
     if (count == 0) {
-        _titleLabel.stringValue = @"No song selected";
-        _titleLabel.toolTip = @"No song selected";
-        _metaLabel.stringValue = @"Open songs to begin";
+        _titleLabel.stringValue = strings::get(Str::no_song_selected);
+        _titleLabel.toolTip = strings::get(Str::no_song_selected);
+        _metaLabel.stringValue = strings::get(Str::open_to_begin);
         return;
     }
     const NSInteger idx = [q queueCurrentIndex];
     NSString* title = idx >= 0 ? ([q queueTitleAtIndex:idx] ?: @"Untitled")
-                               : @"Choose a song";
+                               : strings::get(Str::no_song_selected);
     const NSInteger bpm = idx >= 0 ? [q queueBpmAtIndex:idx] : 0;
     _titleLabel.stringValue = title;
     _titleLabel.toolTip = title;
-    NSString* meta = bpm > 0 ? [NSString stringWithFormat:@"%ld BPM", (long)bpm] : @"Lyre";
+    NSString* meta = bpm > 0 ? [NSString stringWithFormat:@"%ld BPM", (long)bpm]
+                             : strings::get(Str::lyre);
     if (count > 1 && idx >= 0) {
         meta = [NSString stringWithFormat:@"%@   %ld/%ld", meta,
                 (long)(idx + 1), (long)count];
     } else if (idx < 0) {
-        meta = [NSString stringWithFormat:@"%ld songs", (long)count];
+        meta = [NSString stringWithFormat:@"%ld %@", (long)count,
+                strings::get(Str::songs_suffix)];
     }
     _metaLabel.stringValue = meta;
 }
@@ -1314,8 +1730,14 @@ static const char* kNames[3][7] = {
     if (q == nil) {
         return;
     }
+    const NSInteger count = [q queueCount];
+    if (count == 0) {
+        return;
+    }
     const BOOL wasPlaying = _playback->snapshot().state != PlaybackState::stopped;
-    [self loadQueueIndex:[q queueCurrentIndex] - 1 autoplay:wasPlaying];
+    // Wrap: stepping back past the first song lands on the last.
+    const NSInteger prev = ([q queueCurrentIndex] - 1 + count) % count;
+    [self loadQueueIndex:prev autoplay:wasPlaying];
 }
 
 - (void)nextSong {
@@ -1323,8 +1745,14 @@ static const char* kNames[3][7] = {
     if (q == nil) {
         return;
     }
+    const NSInteger count = [q queueCount];
+    if (count == 0) {
+        return;
+    }
     const BOOL wasPlaying = _playback->snapshot().state != PlaybackState::stopped;
-    [self loadQueueIndex:[q queueCurrentIndex] + 1 autoplay:wasPlaying];
+    // Wrap: stepping forward past the last song lands on the first.
+    const NSInteger next = ([q queueCurrentIndex] + 1) % count;
+    [self loadQueueIndex:next autoplay:wasPlaying];
 }
 
 - (void)songPickerChanged:(NSPopUpButton*)sender {
@@ -1332,6 +1760,10 @@ static const char* kNames[3][7] = {
 }
 
 - (void)openSongs:(id)sender {
+    // Bring this app forward so the file picker takes keyboard focus and comes
+    // to the front (the HUD normally runs as a non-activating accessory).
+    [NSApp activateIgnoringOtherApps:YES];
+
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = YES;
@@ -1339,10 +1771,22 @@ static const char* kNames[3][7] = {
     panel.allowedContentTypes = @[
         [UTType typeWithFilenameExtension:@"genshinsheet"]
     ];
-    panel.message = @"Choose .genshinsheet files or folders";
-    panel.prompt = @"Add";
-    [panel beginSheetModalForWindow:self.window
-                    completionHandler:^(NSInteger result) {
+    panel.message = strings::get(Str::panel_message);
+    panel.prompt = strings::get(Str::panel_add);
+    // A standalone (non-sheet) panel is a normal, movable window — the user can
+    // drag it anywhere, unlike a sheet glued to the HUD. Raise it above the
+    // HUD's screen-saver-level window so it isn't hidden behind it.
+    panel.level = NSScreenSaverWindowLevel + 1;
+
+    // Keep the HUD on-screen while the picker is up (opening it focuses this
+    // app, not Genshin, which would otherwise hide the HUD).
+    _openPanelActive = YES;
+    if (!self.window.isVisible) {
+        [self.window orderFrontRegardless];
+    }
+
+    [panel beginWithCompletionHandler:^(NSInteger result) {
+        _openPanelActive = NO;
         if (result != NSModalResponseOK) {
             return;
         }
@@ -1356,17 +1800,14 @@ static const char* kNames[3][7] = {
         if (q == nil || paths.count == 0) {
             return;
         }
-        const BOOL hadSong = _playback->note_count() > 0;
+        // New songs are appended to the end of the queue. Jump to the first of
+        // them so the freshly-added song becomes the current one, ready to play.
+        const NSInteger firstAdded = [q queueCount];
         const NSInteger added = [q queueAddPaths:paths];
         if (added == 0) {
             return;
         }
-        if (!hadSong) {
-            [self loadQueueIndex:0 autoplay:NO];
-        } else {
-            [self reloadQueuePicker];
-            [self reloadQueueMetadata];
-        }
+        [self loadQueueIndex:firstAdded autoplay:NO];
     }];
 }
 
@@ -1379,7 +1820,6 @@ static const char* kNames[3][7] = {
 }
 
 - (void)applyCollapseState:(BOOL)animated {
-    _expandedSection.hidden = _collapsed;
     _miniProgress.hidden = !_collapsed;
     _collapseButton.image = tinted_symbol(_collapsed ? @"chevron.down" : @"chevron.up",
                                           10, NSFontWeightSemibold, ink_soft());
@@ -1387,13 +1827,45 @@ static const char* kNames[3][7] = {
     NSRect frame = self.window.frame;
     frame.origin.y = NSMaxY(frame) - target_h;
     frame.size.height = target_h;
-    if (animated) {
+
+    if (!animated) {
+        _expandedSection.hidden = _collapsed;
+        _expandedSection.alphaValue = _collapsed ? 0.0 : 1.0;
+        [self.window setFrame:frame display:YES];
+        return;
+    }
+
+    if (_collapsed) {
+        // Collapsing: fade the body out first, then slide the panel closed so the
+        // content dissolves instead of clipping mid-slide.
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+            ctx.duration = 0.12;
+            _expandedSection.animator.alphaValue = 0.0;
+        } completionHandler:^{
+            _expandedSection.hidden = YES;
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+                ctx.duration = 0.18;
+                ctx.timingFunction = [CAMediaTimingFunction
+                    functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+                [self.window.animator setFrame:frame display:YES];
+            } completionHandler:nil];
+        }];
+    } else {
+        // Expanding: open the panel first (body still hidden), then fade it in as
+        // the space appears.
+        _expandedSection.alphaValue = 0.0;
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
             ctx.duration = 0.18;
+            ctx.timingFunction = [CAMediaTimingFunction
+                functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
             [self.window.animator setFrame:frame display:YES];
-        } completionHandler:nil];
-    } else {
-        [self.window setFrame:frame display:YES];
+        } completionHandler:^{
+            _expandedSection.hidden = NO;
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+                ctx.duration = 0.14;
+                _expandedSection.animator.alphaValue = 1.0;
+            } completionHandler:nil];
+        }];
     }
 }
 
@@ -1518,23 +1990,28 @@ static const char* kNames[3][7] = {
     }
     const BOOL focused = genshin_is_focused(_genshin_pid);
 
+    // Treat "we're driving our own UI" (pointer over the HUD, or the file
+    // picker open) as not-a-real-blur, so those interactions don't hide the HUD
+    // or pause playback.
+    const BOOL selfInteracting = _pointerInside || _openPanelActive;
+
     // Auto-pause when Genshin loses focus to ANOTHER app — but not for the
-    // brief blur caused by interacting with the HUD itself (pointer inside),
-    // otherwise pressing play would instantly pause playback.
-    if (_autoPauseOnBlur && _wasFocused && !focused && !_pointerInside) {
+    // brief blur caused by interacting with the HUD itself, otherwise pressing
+    // play would instantly pause playback.
+    if (_autoPauseOnBlur && _wasFocused && !focused && !selfInteracting) {
         if (_playback->snapshot().state == PlaybackState::playing) {
             _playback->pause();
         }
     }
-    // Only update the focus edge-tracker once the pointer has left the HUD, so
-    // a HUD click doesn't register as a focus loss on the next real blur.
-    if (!_pointerInside) {
+    // Only update the focus edge-tracker once we're done with our own UI, so a
+    // HUD click / picker doesn't register as a focus loss on the next real blur.
+    if (!selfInteracting) {
         _wasFocused = focused;
     }
 
-    // Keep the HUD visible while the pointer is over it (so you can click
-    // controls even though clicking the HUD unfocuses Genshin momentarily).
-    const BOOL shouldShow = focused || _pointerInside;
+    // Keep the HUD visible while the pointer is over it or the picker is open
+    // (so you can use controls even though that unfocuses Genshin momentarily).
+    const BOOL shouldShow = focused || selfInteracting;
 
     if (!shouldShow) {
         if (self.window.isVisible) {
@@ -1598,25 +2075,25 @@ static const char* kNames[3][7] = {
             countdown_secs = (s.countdown_remaining.count() + 999) / 1000;
             _statusPill.tint = gold();
             _statusPill.pulsing = YES;
-            _statusPill.toolTip = @"counting in";
+            _statusPill.toolTip = strings::get(Str::counting_in);
             _playPause.image = tinted_symbol(@"pause.fill", 18, NSFontWeightMedium, gold());
             break;
         case PlaybackState::playing:
             _statusPill.tint = gold();
             _statusPill.pulsing = YES;
-            _statusPill.toolTip = @"playing";
+            _statusPill.toolTip = strings::get(Str::playing);
             _playPause.image = tinted_symbol(@"pause.fill", 18, NSFontWeightMedium, gold());
             break;
         case PlaybackState::paused:
             _statusPill.tint = ink_soft();
             _statusPill.pulsing = NO;
-            _statusPill.toolTip = @"paused";
+            _statusPill.toolTip = strings::get(Str::paused);
             _playPause.image = tinted_symbol(@"play.fill", 18, NSFontWeightMedium, gold());
             break;
         case PlaybackState::stopped:
             _statusPill.tint = ink_faint();
             _statusPill.pulsing = NO;
-            _statusPill.toolTip = empty ? @"no song" : @"idle";
+            _statusPill.toolTip = empty ? strings::get(Str::no_song) : strings::get(Str::idle);
             _playPause.image = tinted_symbol(@"play.fill", 18, NSFontWeightMedium, gold());
             break;
     }
@@ -1628,10 +2105,11 @@ static const char* kNames[3][7] = {
 
     if (s.state == PlaybackState::countdown) {
         _hint.textColor = gold();
-        _hint.stringValue = [NSString stringWithFormat:@"starting in %lld…", countdown_secs];
+        _hint.stringValue = [NSString stringWithFormat:@"%@ %lld…",
+            strings::get(Str::starting_in), countdown_secs];
     } else if (empty && s.state == PlaybackState::stopped) {
         _hint.textColor = ink_faint();
-        _hint.stringValue = @"open a song to begin";
+        _hint.stringValue = strings::get(Str::open_to_begin);
     } else {
         _hint.stringValue = @"";
     }

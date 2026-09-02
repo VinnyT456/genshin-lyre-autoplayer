@@ -26,3 +26,6 @@ hud-settings.json
 !assets/
 !assets/*.png
 !assets/*.mp4
+
+*.genshinsheet
+*.mid

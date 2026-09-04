@@ -22,7 +22,7 @@
 namespace {
 
 constexpr CGFloat kW = 278.0;
-constexpr CGFloat kH = 282.0;       // expanded height
+constexpr CGFloat kH = 252.0;       // expanded height
 constexpr CGFloat kMiniH = 62.0;    // collapsed: header only
 // Gap from game window edges (top-right dock).
 constexpr CGFloat kTopInset = 40.0;
@@ -30,6 +30,7 @@ constexpr CGFloat kRightInset = 56.0;
 // Local settings keys (hud-settings.json next to the binary).
 constexpr const char* kSettingCollapsed = "collapsed";
 constexpr const char* kSettingAutoPause = "auto_pause_on_blur";
+constexpr const char* kSettingLearn = "learn_mode";
 constexpr const char* kSettingTheme = "theme";
 constexpr const char* kSettingLang = "language";
 
@@ -64,6 +65,19 @@ std::vector<Key> keys_from_label(const std::string& label) {
         }
     }
     return keys;
+}
+
+std::optional<Key> key_from_event(NSEvent* event) {
+    NSString* characters = event.charactersIgnoringModifiers.uppercaseString;
+    if (characters.length != 1) {
+        return std::nullopt;
+    }
+    static const NSString* key_chars = @"QWERTYUASDFGHJZXCVBNM";
+    const NSRange range = [key_chars rangeOfString:characters];
+    if (range.location == NSNotFound) {
+        return std::nullopt;
+    }
+    return static_cast<Key>(range.location);
 }
 
 // --- Palette: one accent used sparingly, driven by the active theme. The
@@ -340,6 +354,8 @@ NSPoint top_right_hud_origin(NSRect game, CGFloat hud_height) {
 
 @interface LyreKeyGridView : NSView
 @property(nonatomic, assign) Keyboard* keyboard;
+@property(nonatomic, weak) id practiceTarget;
+@property(nonatomic) SEL practiceAction;
 - (void)setActiveKeys:(const std::vector<Key>&)keys;
 - (void)setPreviewKeys:(const std::vector<Key>&)keys;  // faint hint when idle
 @end
@@ -485,6 +501,18 @@ static const char* kNames[3][7] = {
     _held = key;
     _pulse[static_cast<std::size_t>(key)] = 1.0;
     _keyboard->keyDown(key);
+    if (_practiceTarget != nil && _practiceAction != nullptr &&
+        [_practiceTarget respondsToSelector:_practiceAction]) {
+        NSMethodSignature* signature = [_practiceTarget methodSignatureForSelector:_practiceAction];
+        if (signature != nil) {
+            NSInvocation* invocation = [NSInvocation invocationWithMethodSignature:signature];
+            invocation.target = _practiceTarget;
+            invocation.selector = _practiceAction;
+            NSNumber* value = @(static_cast<NSInteger>(key));
+            [invocation setArgument:&value atIndex:2];
+            [invocation invoke];
+        }
+    }
     self.needsDisplay = YES;
 }
 
@@ -957,6 +985,11 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 @end
 
 @interface PlayerWindowController () <PanelMouseDelegate>
+- (void)loadQueueIndex:(NSInteger)index
+           sourceIndex:(NSInteger)sourceIndex
+              autoplay:(BOOL)autoplay;
+- (void)practiceKeyPressed:(NSNumber*)value;
+- (void)restartPracticePhrase:(id)sender;
 @end
 
 @implementation PlayerWindowController {
@@ -1047,6 +1080,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         ? Lang::chinese : Lang::english);
 
     _playback->set_countdown(std::chrono::milliseconds(3000));
+    _playback->set_practice_mode(settings::get_bool(kSettingLearn, false));
 
     // Auto-advance to the next queued song when one finishes naturally.
     __weak PlayerWindowController* weak = self;
@@ -1166,10 +1200,12 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSStackView* library_row = _libraryRow;
 
     // ---- Hero: the lyre grid, large. ----
-    _key_grid = [[LyreKeyGridView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 108)];
+    _key_grid = [[LyreKeyGridView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 96)];
     _key_grid.keyboard = keyboard;
+    _key_grid.practiceTarget = self;
+    _key_grid.practiceAction = @selector(practiceKeyPressed:);
     _key_grid.translatesAutoresizingMaskIntoConstraints = NO;
-    [_key_grid.heightAnchor constraintEqualToConstant:108].active = YES;
+    [_key_grid.heightAnchor constraintEqualToConstant:96].active = YES;
 
     // ---- Seek: elapsed  [====bar====]  duration, one tight row ----
     _progress = [[ProgressBar alloc] initWithFrame:NSMakeRect(0, 0, kW - 120, 9)];
@@ -1267,7 +1303,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         library_row, _key_grid, seek_row, transport_row, _hint]];
     expanded.orientation = NSUserInterfaceLayoutOrientationVertical;
     expanded.alignment = NSLayoutAttributeCenterX;
-    expanded.spacing = 10;
+    expanded.spacing = 7;
     expanded.translatesAutoresizingMaskIntoConstraints = NO;
     _expandedSection = expanded;
 
@@ -1402,6 +1438,20 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
+- (void)practiceKeyPressed:(NSNumber*)value {
+    const NSInteger raw = value.integerValue;
+    if (raw < 0 || raw >= 21) {
+        return;
+    }
+    _playback->practice_key(static_cast<Key>(raw));
+    [self refresh];
+}
+
+- (void)restartPracticePhrase:(id)sender {
+    _playback->practice_restart_phrase();
+    [self refresh];
+}
+
 - (void)seekTo:(NSNumber*)fraction {
     _playback->seek_fraction(fraction.doubleValue);
     [self refresh];
@@ -1455,6 +1505,13 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     settings::set_bool(kSettingAutoPause, _autoPauseOnBlur);
 }
 
+- (void)toggleLearnMode:(id)sender {
+    const BOOL enabled = !_playback->practice_mode();
+    _playback->set_practice_mode(enabled);
+    settings::set_bool(kSettingLearn, enabled);
+    [self refresh];
+}
+
 - (NSMenu*)panelContextMenu {
     NSMenu* menu = [[NSMenu alloc] init];
 
@@ -1464,6 +1521,22 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     ap.target = self;
     ap.state = _autoPauseOnBlur ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:ap];
+
+    NSMenuItem* learn = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_learn)
+                                                   action:@selector(toggleLearnMode:)
+                                            keyEquivalent:@""];
+    learn.target = self;
+    learn.state = _playback->practice_mode()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:learn];
+
+    NSMenuItem* restartPhrase = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_restart_phrase)
+               action:@selector(restartPracticePhrase:)
+        keyEquivalent:@""];
+    restartPhrase.target = self;
+    restartPhrase.enabled = _playback->practice_mode();
+    [menu addItem:restartPhrase];
 
     NSMenuItem* reset = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_reset_speed)
                                                    action:@selector(resetSpeed:)
@@ -1607,6 +1680,29 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 - (void)handleGlobalKey:(NSEvent*)event {
     const NSEventModifierFlags flags =
         event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+
+    if (_playback->practice_mode() &&
+        (flags & NSEventModifierFlagCommand) != 0 && event.keyCode == 36) {
+        [self restartPracticePhrase:nil];
+        return;
+    }
+    if (_playback->practice_mode() && flags == 0 && event.keyCode == 53) {
+        [self stopPlayback:nil];
+        return;
+    }
+
+    // In learn mode, observe the same 21 note keys the game receives and let
+    // the practice controller advance only after the expected note/chord is
+    // played. The event is only observed here; it still reaches Genshin.
+    if (_playback->practice_mode() &&
+        (flags & (NSEventModifierFlagCommand | NSEventModifierFlagOption |
+                  NSEventModifierFlagControl)) == 0) {
+        const std::optional<Key> key = key_from_event(event);
+        if (key.has_value()) {
+            [self practiceKeyPressed:@(static_cast<NSInteger>(*key))];
+        }
+    }
+
     if ((flags & NSEventModifierFlagCommand) == 0 ||
         (flags & NSEventModifierFlagOption) == 0) {
         return;
@@ -1665,8 +1761,30 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
                                                       action:@selector(songMenuPicked:)
                                                keyEquivalent:@""];
         item.target = self;
-        item.tag = i;
+        item.representedObject = @{@"songIndex": @(i), @"sourceIndex": @(-1)};
         item.state = (i == idx) ? NSControlStateValueOn : NSControlStateValueOff;
+
+        const NSInteger sourceCount = [q queueSourceCountAtIndex:i];
+        if (sourceCount > 1) {
+            NSMenu* sources = [[NSMenu alloc] initWithTitle:t];
+            const NSInteger selectedSource = [q queueSelectedSourceIndexAtIndex:i];
+            for (NSInteger source = 0; source < sourceCount; ++source) {
+                NSString* sourceTitle = [q queueSourceTitleAtIndex:i sourceIndex:source];
+                NSMenuItem* sourceItem = [[NSMenuItem alloc] initWithTitle:sourceTitle
+                                                                       action:@selector(songMenuPicked:)
+                                                                keyEquivalent:@""];
+                sourceItem.target = self;
+                sourceItem.representedObject = @{
+                    @"songIndex": @(i),
+                    @"sourceIndex": @(source),
+                };
+                sourceItem.state = (i == idx && source == selectedSource)
+                    ? NSControlStateValueOn
+                    : NSControlStateValueOff;
+                [sources addItem:sourceItem];
+            }
+            item.submenu = sources;
+        }
         [menu addItem:item];
     }
     _songPicker.menu_ = menu;
@@ -1675,7 +1793,13 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)songMenuPicked:(NSMenuItem*)sender {
-    [self loadQueueIndex:sender.tag autoplay:NO];
+    NSDictionary* selection = sender.representedObject;
+    if (selection == nil) {
+        return;
+    }
+    const NSInteger songIndex = [selection[@"songIndex"] integerValue];
+    const NSInteger sourceIndex = [selection[@"sourceIndex"] integerValue];
+    [self loadQueueIndex:songIndex sourceIndex:sourceIndex autoplay:NO];
 }
 
 - (void)reloadQueueMetadata {
@@ -1709,12 +1833,18 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)loadQueueIndex:(NSInteger)index autoplay:(BOOL)autoplay {
+    [self loadQueueIndex:index sourceIndex:-1 autoplay:autoplay];
+}
+
+- (void)loadQueueIndex:(NSInteger)index
+           sourceIndex:(NSInteger)sourceIndex
+              autoplay:(BOOL)autoplay {
     id<PlayerQueueDelegate> q = self.queueDelegate;
     if (q == nil || index < 0 || index >= [q queueCount]) {
         return;
     }
     _playback->stop();
-    if (![q queueLoadIndex:index]) {
+    if (![q queueLoadIndex:index sourceIndex:sourceIndex]) {
         return;
     }
     [self reloadQueuePicker];
@@ -1769,7 +1899,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     panel.canChooseDirectories = YES;
     panel.allowsMultipleSelection = YES;
     panel.allowedContentTypes = @[
-        [UTType typeWithFilenameExtension:@"genshinsheet"]
+        [UTType typeWithFilenameExtension:@"genshinsheet"],
+        [UTType typeWithFilenameExtension:@"mid"],
+        [UTType typeWithFilenameExtension:@"midi"]
     ];
     panel.message = strings::get(Str::panel_message);
     panel.prompt = strings::get(Str::panel_add);
@@ -1805,6 +1937,10 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         const NSInteger firstAdded = [q queueCount];
         const NSInteger added = [q queueAddPaths:paths];
         if (added == 0) {
+            // The files may have been added as alternate sources to an
+            // existing song; refresh the menu even though no new song row was
+            // created.
+            [self reloadQueuePicker];
             return;
         }
         [self loadQueueIndex:firstAdded autoplay:NO];
@@ -2103,7 +2239,36 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _controls.alphaValue = controlsAlpha;
     _progress.alphaValue = controlsAlpha;
 
-    if (s.state == PlaybackState::countdown) {
+    NSString* phraseLabel = s.practice_phrase_count > 0
+        ? [NSString stringWithFormat:@"Phrase %lu/%lu",
+            static_cast<unsigned long>(s.practice_phrase_index + 1),
+            static_cast<unsigned long>(s.practice_phrase_count)]
+        : @"";
+    if (_playback->practice_mode() && s.state == PlaybackState::playing) {
+        _hint.textColor = gold();
+        _hint.stringValue = s.current_note.empty()
+            ? strings::get(Str::learn_complete)
+            : [NSString stringWithFormat:@"%@ · %@",
+                phraseLabel,
+                [NSString stringWithFormat:strings::get(Str::learn_note),
+                    [NSString stringWithUTF8String:s.current_note.c_str()]]];
+    } else if (_playback->practice_mode() && s.state == PlaybackState::paused) {
+        _hint.textColor = ink_soft();
+        _hint.stringValue = s.current_note.empty()
+            ? strings::get(Str::learn_complete)
+            : [NSString stringWithFormat:@"%@ · %@ · %@",
+                phraseLabel,
+                strings::get(Str::paused),
+                [NSString stringWithFormat:strings::get(Str::learn_note),
+                    [NSString stringWithUTF8String:s.current_note.c_str()]]];
+    } else if (_playback->practice_mode() && s.progress >= 1.0 && !empty) {
+        _hint.textColor = gold();
+        _hint.stringValue = strings::get(Str::learn_complete);
+    } else if (_playback->practice_mode() && !empty) {
+        _hint.textColor = ink_faint();
+        _hint.stringValue = [NSString stringWithFormat:@"%@ · %@",
+            phraseLabel, strings::get(Str::learn_ready)];
+    } else if (s.state == PlaybackState::countdown) {
         _hint.textColor = gold();
         _hint.stringValue = [NSString stringWithFormat:@"%@ %lld…",
             strings::get(Str::starting_in), countdown_secs];

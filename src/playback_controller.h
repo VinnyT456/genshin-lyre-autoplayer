@@ -7,12 +7,22 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "keyboard.h"
 #include "note.h"
 
 enum class PlaybackState { stopped, countdown, playing, paused };
+
+enum class PracticeInputResult {
+    ignored,
+    wrong,
+    partial,
+    advanced,
+    phrase_completed,
+    completed
+};
 
 struct PlaybackSnapshot {
     PlaybackState state;
@@ -22,6 +32,8 @@ struct PlaybackSnapshot {
     std::string current_note;
     std::string next_note;
     std::vector<Key> active_keys;
+    std::size_t practice_phrase_index;
+    std::size_t practice_phrase_count;
     bool loop;                                        // whole-song loop enabled
     double speed;                                     // playback rate multiplier
     std::chrono::milliseconds countdown_remaining;    // > 0 while counting in
@@ -52,6 +64,13 @@ public:
 
     // Count-in length before playback actually fires keys.
     void set_countdown(std::chrono::milliseconds duration);
+
+    // Learn mode: the song advances only when the user supplies the expected
+    // key or chord. It never posts automatic keystrokes.
+    void set_practice_mode(bool enabled);
+    bool practice_mode() const;
+    PracticeInputResult practice_key(Key key);
+    void practice_restart_phrase();
 
     // Called (on the worker thread) when a song finishes naturally — not on
     // stop/pause/seek, and not when looping. Used for queue auto-advance.
@@ -84,6 +103,14 @@ private:
     std::chrono::milliseconds paused_elapsed_{0};
     std::chrono::milliseconds countdown_{std::chrono::milliseconds(0)};
     bool loop_ = false;
+    bool practice_mode_ = false;
+    std::size_t practice_index_ = 0;
+    std::size_t practice_phrase_index_ = 0;
+    std::vector<std::pair<std::size_t, std::size_t>> practice_phrases_;
+    std::vector<Key> practice_pressed_;
     double speed_ = 1.0;
     std::function<void()> on_finished_;
+
+    void rebuild_practice_phrases_locked();
+    void reset_practice_locked();
 };

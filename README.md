@@ -33,8 +33,9 @@ If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo
 ## What it does
 
 - **Docks to Genshin.** Starts at the game window's top-right and follows it as it moves; drag it anywhere and it keeps your spot. Hides when Genshin isn't frontmost.
-- **Plays sheets for you.** Open one or many `.genshinsheet` files (or a folder) as a playlist. Play / pause / stop, seek, loop, and change speed.
+- **Plays songs for you.** Open one or many `.genshinsheet`, `.mid`, or `.midi` files (or a folder) as a playlist. Matching sheet and MIDI files in the same folder are grouped as one song, with the alternate source available from the song picker. Play / pause / stop, seek, loop, and change speed.
 - **Shows what it's doing.** The 21-key lyre grid lights up in real time; a progress bar and a pulsing status dot track playback.
+- **Helps you learn.** Learn mode breaks a song into phrase-sized groups, highlights the expected note or chord, and advances only when you play it from the keyboard or HUD, without automatic playback. Use the gear menu to restart the current phrase; Loop repeats that phrase instead of the entire song.
 - **Plays by hand too.** Click keys on the HUD grid to send that note to Genshin yourself.
 - **Feels human.** Variable key-hold and chord stagger, a 3-second count-in before it starts, and auto-advance to the next song.
 - **Stays targeted.** Keystrokes are posted only to the Genshin process (`CGEventPostToPid`) — nothing is injected into the game.
@@ -55,7 +56,7 @@ make build
 make run
 ```
 
-Then in the HUD: **Open songs…** → pick `.genshinsheet` files (export them from [Genshin Music](https://specy.github.io/genshinMusic/)) → press play. A 3-second count-in runs, then the keys go to Genshin.
+Then in the HUD: **Open songs…** → pick `.genshinsheet` or MIDI files (export sheets from [Genshin Music](https://specy.github.io/genshinMusic/)) → press play. A 3-second count-in runs, then the keys go to Genshin.
 
 > First, import the keymap and equip the lyre — see [PlayCover keymap](#playcover-keymap) below. Without it, the synthetic keys never reach the lyre.
 
@@ -82,6 +83,8 @@ Import it in PlayCover's keymapping for Genshin, then equip the lyre in-game.
 | Seek bar | Click or drag to scrub |
 | Speed button | Click to cycle presets (0.5× → 2×); scroll over the HUD for fine steps (0.25×–3×) |
 | Click a lyre key | Send that note to Genshin manually |
+| Learn mode (gear menu) | Practice the current song note-by-note; automatic playback is disabled |
+| Restart phrase (gear menu / `⌘↩`) | Return to the beginning of the current inferred phrase |
 | `+` (header) | Add more songs to the playlist |
 | Chevron | Collapse to a mini bar |
 | `×` | Hide the HUD and stop |
@@ -103,8 +106,8 @@ Or call the binary directly:
 
 ```bash
 ./macauto.out
-./macauto.out song.genshinsheet folder/
-./macauto.out --no-hud song.genshinsheet
+./macauto.out song.genshinsheet song.mid folder/
+./macauto.out --no-hud song.mid
 ```
 
 Quote paths that contain spaces or `()`. The playlist is remembered between launches; with no arguments the HUD restores the last one.
@@ -121,15 +124,15 @@ Sending keystrokes to Genshin (`CGEventPostToPid`) is gated by macOS's **Accessi
 2. Enable your terminal (Terminal, iTerm, etc.) in the list.
 3. Relaunch and try again.
 
-## Sheets
+## Supported song files
 
-The parser currently accepts **[Specy's Genshin Music](https://specy.github.io/genshinMusic/)** `.genshinsheet` JSON (`name`, `bpm`, `notes`). Export from the [Player](https://specy.github.io/genshinMusic/); note indices 0–20 map to `Q…M` as shown above. Other formats are planned.
+The parser accepts **[Specy's Genshin Music](https://specy.github.io/genshinMusic/)** `.genshinsheet` JSON and PPQ-based Standard MIDI Files in formats 0 and 1 (`.mid` / `.midi`). MIDI note-on events are converted to timed chords using the file's division and tempo map. When a valid MIDI key signature is present, notes are uniformly transposed toward C major or A minor and then shifted by octaves to maximize playable lyre notes. Non-standard key-signature metadata is ignored so otherwise valid MIDI files can still load. Only the lyre's 21 natural notes, C3–B5 (`Z…M`, `A…J`, `Q…U`), can be played exactly; remaining accidentals and out-of-range pitches are skipped.
 
 ## How it works
 
 - **PlayerWindow** (`src/PlayerWindow.mm`) — the HUD: a borderless `NSPanel` at screen-saver window level, custom-drawn lyre grid / seek bar / status dot, window-follow and focus logic.
 - **PlaybackController** (`src/playback_controller.cpp`) — a worker thread that fires notes on schedule; handles play/pause/stop, seek, loop, speed, and count-in.
-- **parser** (`src/parser.cpp`) — `.genshinsheet` → timed `Note`s.
+- **parser** (`src/parser.cpp`) — `.genshinsheet` / MIDI → timed `Note`s.
 - **keyboard** (`src/keyboard.mm`) — posts `CGEvent` key presses to the Genshin pid, with human-like jitter.
 - **genshin** (`src/genshin.mm`) — locates and focuses the Genshin process.
 - **settings** (`src/settings.cpp`) — reads/writes the local `hud-settings.json`.

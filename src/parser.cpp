@@ -1,12 +1,405 @@
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <iostream>
-#include <stdexcept>
-#include <cmath>
 #include "parser.h"
 
 using namespace std;
+
+namespace {
+
+class MidiReader {
+public:
+    explicit MidiReader(const vector<uint8_t>& bytes) : bytes_(bytes) {}
+
+    size_t remaining() const { return bytes_.size() - position_; }
+
+    uint8_t byte() {
+        if (remaining() < 1) {
+            throw runtime_error("Unexpected end of MIDI data");
+        }
+        return bytes_[position_++];
+    }
+
+    uint16_t big_endian_u16() {
+        return static_cast<uint16_t>(byte()) << 8 | byte();
+    }
+
+    uint32_t big_endian_u32() {
+        return static_cast<uint32_t>(byte()) << 24 |
+               static_cast<uint32_t>(byte()) << 16 |
+               static_cast<uint32_t>(byte()) << 8 |
+               byte();
+    }
+
+    uint32_t variable_length() {
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t next = byte();
+            value = (value << 7) | (next & 0x7f);
+            if ((next & 0x80) == 0) {
+                return value;
+            }
+        }
+        throw runtime_error("Invalid MIDI variable-length value");
+    }
+
+    string text(size_t length) {
+        if (remaining() < length) {
+            throw runtime_error("Truncated MIDI text event");
+        }
+        string value(bytes_.begin() + static_cast<ptrdiff_t>(position_),
+                     bytes_.begin() + static_cast<ptrdiff_t>(position_ + length));
+        position_ += length;
+        value.erase(remove(value.begin(), value.end(), '\0'), value.end());
+        return value;
+    }
+
+    vector<uint8_t> bytes(size_t length) {
+        if (remaining() < length) {
+            throw runtime_error("Truncated MIDI track");
+        }
+        vector<uint8_t> value(bytes_.begin() + static_cast<ptrdiff_t>(position_),
+                              bytes_.begin() + static_cast<ptrdiff_t>(position_ + length));
+        position_ += length;
+        return value;
+    }
+
+    void skip(size_t length) {
+        if (remaining() < length) {
+            throw runtime_error("Truncated MIDI event");
+        }
+        position_ += length;
+    }
+
+private:
+    const vector<uint8_t>& bytes_;
+    size_t position_ = 0;
+};
+
+struct MidiRawNote {
+    uint64_t tick;
+    uint8_t pitch;
+};
+
+struct MidiTempoChange {
+    uint64_t tick;
+    uint32_t microseconds_per_quarter;
+};
+
+struct MidiTempoSegment {
+    uint64_t tick;
+    uint32_t microseconds_per_quarter;
+    long double elapsed_microseconds;
+};
+
+struct MidiData {
+    vector<MidiRawNote> notes;
+    vector<MidiTempoChange> tempos;
+    string title;
+    int8_t key_sharps_flats = 0;
+    bool key_minor = false;
+    bool has_key_signature = false;
+    uint16_t division = 0;
+};
+
+vector<uint8_t> read_binary_file(const string& path) {
+    ifstream file(path, ios::binary);
+    if (!file.is_open()) {
+        throw runtime_error("Unable to open MIDI file: " + path);
+    }
+
+    file.seekg(0, ios::end);
+    const streamoff size = file.tellg();
+    if (size < 0) {
+        throw runtime_error("Unable to read MIDI file: " + path);
+    }
+    file.seekg(0, ios::beg);
+
+    vector<uint8_t> bytes(static_cast<size_t>(size));
+    if (!bytes.empty() && !file.read(reinterpret_cast<char*>(bytes.data()), size)) {
+        throw runtime_error("Unable to read MIDI file: " + path);
+    }
+    return bytes;
+}
+
+void parse_midi_track(const vector<uint8_t>& bytes, MidiData& result) {
+    MidiReader reader(bytes);
+    uint64_t tick = 0;
+    uint8_t running_status = 0;
+
+    while (reader.remaining() > 0) {
+        tick += reader.variable_length();
+        const uint8_t first = reader.byte();
+        const bool has_running_data = first < 0x80;
+        const uint8_t status = has_running_data ? running_status : first;
+        if (status < 0x80) {
+            throw runtime_error("MIDI event is missing running status");
+        }
+
+        const uint8_t first_data = has_running_data ? first : 0;
+        if (!has_running_data && status >= 0x80 && status <= 0xef) {
+            running_status = status;
+        }
+
+        if (status == 0xff) {
+            running_status = 0;
+            const uint8_t meta_type = reader.byte();
+            const uint32_t length = reader.variable_length();
+            if (meta_type == 0x03) {
+                const string track_title = reader.text(length);
+                if (result.title.empty() && !track_title.empty()) {
+                    result.title = track_title;
+                }
+            } else if (meta_type == 0x51 && length == 3) {
+                const uint32_t tempo = static_cast<uint32_t>(reader.byte()) << 16 |
+                                       static_cast<uint32_t>(reader.byte()) << 8 |
+                                       reader.byte();
+                if (tempo == 0) {
+                    throw runtime_error("MIDI tempo cannot be zero");
+                }
+                result.tempos.push_back({tick, tempo});
+            } else if (meta_type == 0x59 && length == 2) {
+                const uint8_t encoded_sharps_flats = reader.byte();
+                const uint8_t mode = reader.byte();
+                const int8_t sharps_flats = static_cast<int8_t>(encoded_sharps_flats);
+                // The MIDI spec stores this as a signed value in -7..7. Some
+                // exports write an out-of-range value here; it is only
+                // advisory metadata, so ignore that signature rather than
+                // rejecting an otherwise playable file.
+                if (sharps_flats >= -7 && sharps_flats <= 7 && mode <= 1 &&
+                    !result.has_key_signature && tick == 0) {
+                    // A single uniform transposition is applied to the file,
+                    // so use the first key signature at tick zero as source.
+                    result.key_sharps_flats = sharps_flats;
+                    result.key_minor = mode == 1;
+                    result.has_key_signature = true;
+                }
+            } else {
+                reader.skip(length);
+            }
+            if (meta_type == 0x2f) {
+                return;
+            }
+            continue;
+        }
+
+        if (status == 0xf0 || status == 0xf7) {
+            running_status = 0;
+            reader.skip(reader.variable_length());
+            continue;
+        }
+
+        const uint8_t event = status & 0xf0;
+        if (event == 0x90 || event == 0x80) {
+            const uint8_t pitch = has_running_data ? first_data : reader.byte();
+            const uint8_t velocity = reader.byte();
+            if (event == 0x90 && velocity != 0) {
+                result.notes.push_back({tick, pitch});
+            }
+            continue;
+        }
+
+        if (event == 0xc0 || event == 0xd0) {
+            if (!has_running_data) {
+                reader.skip(1);
+            }
+            continue;
+        }
+
+        if (event == 0xa0 || event == 0xb0 || event == 0xe0) {
+            reader.skip(has_running_data ? 1 : 2);
+            continue;
+        }
+
+        // System common messages are uncommon in Standard MIDI Files, but
+        // consuming their data keeps a valid file parseable if they appear.
+        running_status = 0;
+        if (status == 0xf1 || status == 0xf3) {
+            reader.skip(1);
+        } else if (status == 0xf2) {
+            reader.skip(2);
+        } else if (status == 0xf6) {
+            continue;
+        } else {
+            throw runtime_error("Unsupported MIDI event");
+        }
+    }
+}
+
+MidiData parse_midi_file(const string& path) {
+    const vector<uint8_t> bytes = read_binary_file(path);
+    MidiReader reader(bytes);
+    if (reader.remaining() < 14 || reader.text(4) != "MThd") {
+        throw runtime_error("Invalid MIDI header");
+    }
+
+    const uint32_t header_length = reader.big_endian_u32();
+    if (header_length < 6 || reader.remaining() < header_length) {
+        throw runtime_error("Invalid MIDI header length");
+    }
+    const uint16_t format = reader.big_endian_u16();
+    const uint16_t track_count = reader.big_endian_u16();
+    const uint16_t division = reader.big_endian_u16();
+    reader.skip(header_length - 6);
+
+    if (format > 2) {
+        throw runtime_error("Unsupported MIDI format");
+    }
+    if (format == 2) {
+        throw runtime_error("MIDI format 2 is not supported");
+    }
+    if (track_count == 0 || (format == 0 && track_count != 1) ||
+        (division & 0x8000) != 0 || division == 0) {
+        throw runtime_error("MIDI must use a positive ticks-per-quarter division");
+    }
+
+    MidiData result;
+    result.division = division;
+    for (uint16_t track = 0; track < track_count; ++track) {
+        if (reader.remaining() < 8 || reader.text(4) != "MTrk") {
+            throw runtime_error("Invalid MIDI track header");
+        }
+        const uint32_t track_length = reader.big_endian_u32();
+        parse_midi_track(reader.bytes(track_length), result);
+    }
+    return result;
+}
+
+optional<Key> midi_key(uint8_t pitch) {
+    static constexpr array<uint8_t, 21> pitches = {
+        72, 74, 76, 77, 79, 81, 83,
+        60, 62, 64, 65, 67, 69, 71,
+        48, 50, 52, 53, 55, 57, 59
+    };
+    for (size_t index = 0; index < pitches.size(); ++index) {
+        if (pitches[index] == pitch) {
+            return static_cast<Key>(index);
+        }
+    }
+    return nullopt;
+}
+
+int midi_tonic_pitch_class(int8_t sharps_flats, bool minor) {
+    static constexpr array<int, 15> major_tonics = {
+        11, 6, 1, 8, 3, 10, 5, 0,
+         7, 2, 9, 4, 11, 6, 1
+    };
+    static constexpr array<int, 15> minor_tonics = {
+         8, 3, 10, 5, 0, 7, 2, 9,
+         4, 11, 6, 1, 8, 3, 10
+    };
+    const int index = static_cast<int>(sharps_flats) + 7;
+    if (index < 0 || index >= 15) {
+        throw runtime_error("Invalid MIDI key signature");
+    }
+    return (minor ? minor_tonics : major_tonics)[static_cast<size_t>(index)];
+}
+
+int midi_base_transposition(int8_t sharps_flats, bool minor) {
+    const int target = minor ? 9 : 0;  // A minor or C major.
+    int shift = target - midi_tonic_pitch_class(sharps_flats, minor);
+    while (shift > 6) {
+        shift -= 12;
+    }
+    while (shift < -6) {
+        shift += 12;
+    }
+    return shift;
+}
+
+int midi_transposition(const vector<MidiRawNote>& notes,
+                       int8_t sharps_flats, bool minor) {
+    const int base = midi_base_transposition(sharps_flats, minor);
+    int best_shift = base;
+    size_t best_playable_range_count = 0;
+
+    for (int octave = -2; octave <= 2; ++octave) {
+        const int candidate = base + octave * 12;
+        size_t playable_count = 0;
+        for (const MidiRawNote& note : notes) {
+            const int pitch = static_cast<int>(note.pitch) + candidate;
+            if (pitch >= 0 && pitch <= 127 &&
+                midi_key(static_cast<uint8_t>(pitch)).has_value()) {
+                ++playable_count;
+            }
+        }
+
+        if (playable_count > best_playable_range_count ||
+            (playable_count == best_playable_range_count &&
+             abs(candidate) < abs(best_shift))) {
+            best_shift = candidate;
+            best_playable_range_count = playable_count;
+        }
+    }
+    return best_shift;
+}
+
+vector<MidiTempoSegment> build_tempo_segments(
+    vector<MidiTempoChange> tempos, uint16_t division) {
+    sort(tempos.begin(), tempos.end(), [](const MidiTempoChange& a,
+                                         const MidiTempoChange& b) {
+        return a.tick < b.tick;
+    });
+
+    vector<MidiTempoChange> effective;
+    for (const MidiTempoChange& tempo : tempos) {
+        if (!effective.empty() && effective.back().tick == tempo.tick) {
+            effective.back() = tempo;
+        } else {
+            effective.push_back(tempo);
+        }
+    }
+
+    vector<MidiTempoSegment> segments{{0, 500000, 0.0L}};
+    uint64_t previous_tick = 0;
+    uint32_t current_tempo = 500000;  // MIDI default: 120 BPM.
+    for (const MidiTempoChange& tempo : effective) {
+        if (tempo.tick == 0) {
+            segments.front().microseconds_per_quarter = tempo.microseconds_per_quarter;
+            current_tempo = tempo.microseconds_per_quarter;
+            continue;
+        }
+        const long double elapsed = segments.back().elapsed_microseconds +
+            static_cast<long double>(tempo.tick - previous_tick) *
+            current_tempo / division;
+        segments.push_back({tempo.tick, tempo.microseconds_per_quarter, elapsed});
+        previous_tick = tempo.tick;
+        current_tempo = tempo.microseconds_per_quarter;
+    }
+    return segments;
+}
+
+long double midi_time_microseconds(uint64_t tick,
+                                   uint16_t division,
+                                   const vector<MidiTempoSegment>& segments) {
+    const auto it = upper_bound(
+        segments.begin(), segments.end(), tick,
+        [](uint64_t value, const MidiTempoSegment& segment) {
+            return value < segment.tick;
+        });
+    const MidiTempoSegment& segment = *(it == segments.begin() ? it : it - 1);
+    return segment.elapsed_microseconds +
+        static_cast<long double>(tick - segment.tick) *
+        segment.microseconds_per_quarter / division;
+}
+
+bool is_midi_path(const string& path) {
+    string extension = filesystem::path(path).extension().string();
+    transform(extension.begin(), extension.end(), extension.begin(),
+              [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    return extension == ".mid" || extension == ".midi";
+}
+
+}  // namespace
 
 
 GenshinSheetParser::GenshinSheetParser(string file_path)
@@ -50,14 +443,18 @@ json GenshinSheetParser::parse() {
     }
 
     metadata.title = song[0].value("name", "Untitled");
-    metadata.bpm = 60000 / song[0].value("bpm", 0) ;
+    const int bpm = song[0].value("bpm", 0);
+    if (bpm <= 0) {
+        throw runtime_error("Invalid sheet tempo");
+    }
+    metadata.bpm = bpm;
     metadata.type = song[0].value("type", "composed") == "composed" ? Composed : Recorded;
 
     return song;
 }
 
 vector<ComposedNote> GenshinSheetParser::parse_composed(json song) {
-    const double ms_per_beat = metadata.bpm;
+    const double ms_per_beat = 60000.0 / metadata.bpm;
     vector<ComposedNote> song_notes;
     double time = 0.0;
 
@@ -156,7 +553,71 @@ vector<Note> GenshinSheetParser::translate_recorded(json song) {
     return result;
 }
 
+vector<Note> GenshinSheetParser::translate_midi() {
+    MidiData midi = parse_midi_file(file_path);
+    metadata.type = Midi;
+
+    const vector<MidiTempoSegment> tempo_segments =
+        build_tempo_segments(midi.tempos, midi.division);
+    const uint32_t first_tempo = tempo_segments.front().microseconds_per_quarter;
+    metadata.bpm = static_cast<int>(llround(60000000.0 / first_tempo));
+    metadata.title = midi.title;
+    if (metadata.title.empty()) {
+        metadata.title = filesystem::path(file_path).stem().string();
+    }
+    if (metadata.title.empty()) {
+        metadata.title = "Untitled";
+    }
+
+    sort(midi.notes.begin(), midi.notes.end(), [](const MidiRawNote& a,
+                                                 const MidiRawNote& b) {
+        if (a.tick != b.tick) {
+            return a.tick < b.tick;
+        }
+        return a.pitch < b.pitch;
+    });
+
+    const int transposition = midi_transposition(
+        midi.notes,
+        midi.has_key_signature ? midi.key_sharps_flats : 0,
+        midi.has_key_signature && midi.key_minor);
+    vector<Note> result;
+    uint64_t result_tick = numeric_limits<uint64_t>::max();
+    for (const MidiRawNote& raw : midi.notes) {
+        const int transposed_pitch = static_cast<int>(raw.pitch) + transposition;
+        if (transposed_pitch < 0 || transposed_pitch > 127) {
+            continue;
+        }
+        const optional<Key> key = midi_key(static_cast<uint8_t>(transposed_pitch));
+        if (!key.has_value()) {
+            // The in-game lyre has 21 natural-note keys. Accidentals and
+            // pitches outside C3-B5 cannot be represented exactly after the
+            // uniform transposition, so omit them instead of playing a wrong
+            // note.
+            continue;
+        }
+
+        const auto timestamp = chrono::milliseconds(static_cast<long long>(llround(
+            midi_time_microseconds(raw.tick, midi.division, tempo_segments) / 1000.0L)));
+        if (result.empty() || result_tick != raw.tick) {
+            result.emplace_back(vector<Key>{*key}, timestamp);
+            result_tick = raw.tick;
+            continue;
+        }
+
+        auto& chord = result.back().keys;
+        if (find(chord.begin(), chord.end(), *key) == chord.end()) {
+            chord.push_back(*key);
+        }
+    }
+
+    return result;
+}
+
 vector<Note> GenshinSheetParser::translate() {
+    if (is_midi_path(file_path)) {
+        return translate_midi();
+    }
     json song = parse();
     if (metadata.type == Composed) {
         return translate_composed(song);

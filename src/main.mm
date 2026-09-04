@@ -2,8 +2,10 @@
 #import <ApplicationServices/ApplicationServices.h>
 
 #include <iostream>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "PlayerWindow.h"
@@ -51,7 +53,14 @@ std::string absolute_path(NSString* path) {
     return standardized.UTF8String;
 }
 
-// Expand a path: a directory contributes all its *.genshinsheet files. All
+bool is_supported_song_file(NSString* path) {
+    NSString* extension = path.pathExtension.lowercaseString;
+    return [extension isEqualToString:@"genshinsheet"] ||
+           [extension isEqualToString:@"mid"] ||
+           [extension isEqualToString:@"midi"];
+}
+
+// Expand a path: a directory contributes all supported song files. All
 // results are absolute.
 void collect_sheets(const std::string& path, std::vector<std::string>& out) {
     NSString* ns = [NSString stringWithUTF8String:path.c_str()];
@@ -70,15 +79,70 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
         [[fm contentsOfDirectoryAtPath:ns error:nil]
             sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
     for (NSString* entry in entries) {
-        if ([entry.pathExtension isEqualToString:@"genshinsheet"]) {
+        if (is_supported_song_file(entry)) {
             out.push_back(absolute_path([ns stringByAppendingPathComponent:entry]));
         }
     }
 }
 
+struct PlaylistEntry {
+    std::vector<std::string> sources;
+};
+
+// Files with the same name in the same folder are alternate representations
+// of one song (for example, Song.genshinsheet and Song.mid). Keeping the
+// directory in the key avoids merging unrelated songs that merely share a
+// title in different folders.
+std::string playlist_group_key(const std::string& path) {
+    NSString* ns = [NSString stringWithUTF8String:path.c_str()];
+    NSString* directory = ns.stringByDeletingLastPathComponent.lowercaseString;
+    NSString* stem = [ns.lastPathComponent stringByDeletingPathExtension].lowercaseString;
+    return std::string(directory.UTF8String ?: "") + "\n" +
+           std::string(stem.UTF8String ?: "");
+}
+
+int source_priority(const std::string& path) {
+    NSString* extension = [NSString stringWithUTF8String:path.c_str()]
+                              .pathExtension.lowercaseString;
+    if ([extension isEqualToString:@"genshinsheet"]) {
+        return 0;
+    }
+    return 1;
+}
+
+void add_playlist_path(std::vector<PlaylistEntry>& songs, std::string path) {
+    const std::string key = playlist_group_key(path);
+    for (PlaylistEntry& song : songs) {
+        if (playlist_group_key(song.sources.front()) != key) {
+            continue;
+        }
+        if (std::find(song.sources.begin(), song.sources.end(), path) == song.sources.end()) {
+            song.sources.push_back(std::move(path));
+            std::stable_sort(song.sources.begin(), song.sources.end(),
+                             [](const std::string& left, const std::string& right) {
+                                 const int left_priority = source_priority(left);
+                                 const int right_priority = source_priority(right);
+                                 return left_priority != right_priority
+                                     ? left_priority < right_priority
+                                     : left < right;
+                             });
+        }
+        return;
+    }
+    songs.push_back(PlaylistEntry{{std::move(path)}});
+}
+
+std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& songs) {
+    std::vector<std::string> paths;
+    for (const PlaylistEntry& song : songs) {
+        paths.insert(paths.end(), song.sources.begin(), song.sources.end());
+    }
+    return paths;
+}
+
 }  // namespace
 
-// Owns the playlist of sheet paths and swaps songs into the shared
+// Owns the playlist of song paths and swaps songs into the shared
 // PlaybackController on demand. Parsing is lazy (per load) so a big folder
 // costs nothing until a song is selected.
 @interface SongQueue : NSObject <PlayerQueueDelegate>
@@ -89,7 +153,8 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
 @end
 
 @implementation SongQueue {
-    std::vector<std::string> _paths;
+    std::vector<PlaylistEntry> _songs;
+    std::vector<size_t> _selected_sources;
     std::vector<std::string> _titles;
     std::vector<int> _bpms;
     NSInteger _current;
@@ -100,12 +165,15 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
                      playback:(PlaybackController*)playback {
     self = [super init];
     if (self != nil) {
-        _paths = std::move(paths);
-        _titles.assign(_paths.size(), std::string());
-        _bpms.assign(_paths.size(), 0);
+        for (std::string& path : paths) {
+            add_playlist_path(_songs, std::move(path));
+        }
+        _selected_sources.assign(_songs.size(), 0);
+        _titles.assign(_songs.size(), std::string());
+        _bpms.assign(_songs.size(), 0);
         _current = -1;
         _playback = playback;
-        if (!_paths.empty()) {
+        if (!_songs.empty()) {
             [self persistPaths];
         }
     }
@@ -113,49 +181,73 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
 }
 
 - (BOOL)primeFirst {
-    return _paths.empty() ? NO : [self queueLoadIndex:0];
+    return _songs.empty() ? NO : [self queueLoadIndex:0];
 }
 
 - (NSInteger)queueCount {
-    return static_cast<NSInteger>(_paths.size());
+    return static_cast<NSInteger>(_songs.size());
 }
 
 - (NSInteger)queueCurrentIndex {
     return _current;
 }
 
-- (BOOL)queueLoadIndex:(NSInteger)index {
-    if (index < 0 || index >= static_cast<NSInteger>(_paths.size())) {
+- (BOOL)queueLoadIndex:(NSInteger)index sourceIndex:(NSInteger)sourceIndex {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
         return NO;
     }
-    try {
-        GenshinSheetParser parser(_paths[index]);
-        std::vector<Note> notes = parser.translate();
-        if (notes.empty()) {
-            std::cerr << "No notes in " << _paths[index] << '\n';
-            return NO;
+    const PlaylistEntry& song = _songs[static_cast<size_t>(index)];
+    if (song.sources.empty()) {
+        return NO;
+    }
+    const bool requested_source =
+        sourceIndex >= 0 && sourceIndex < static_cast<NSInteger>(song.sources.size());
+    size_t preferred_source = requested_source
+        ? static_cast<size_t>(sourceIndex)
+        : _selected_sources[static_cast<size_t>(index)];
+    if (preferred_source >= song.sources.size()) {
+        preferred_source = 0;
+    }
+
+    const size_t attempts = requested_source ? 1 : song.sources.size();
+    for (size_t attempt = 0; attempt < attempts; ++attempt) {
+        const size_t candidate = (preferred_source + attempt) % song.sources.size();
+        try {
+            GenshinSheetParser parser(song.sources[candidate]);
+            std::vector<Note> notes = parser.translate();
+            if (notes.empty()) {
+                throw std::runtime_error("song contains no playable notes");
+            }
+            _selected_sources[static_cast<size_t>(index)] = candidate;
+            _titles[static_cast<size_t>(index)] = parser.song_metadata().title;
+            _bpms[static_cast<size_t>(index)] = parser.song_metadata().bpm;
+            _playback->set_notes(std::move(notes));
+            _current = index;
+            return YES;
+        } catch (const std::exception& error) {
+            std::cerr << "Failed to load " << song.sources[candidate] << ": "
+                      << error.what() << '\n';
         }
-        _titles[index] = parser.song_metadata().title;
-        _bpms[index] = parser.song_metadata().bpm;
-        _playback->set_notes(std::move(notes));
-        _current = index;
-        return YES;
-    } catch (const std::exception& error) {
-        std::cerr << "Failed to load " << _paths[index] << ": "
-                  << error.what() << '\n';
-        return NO;
     }
+    return NO;
+}
+
+- (BOOL)queueLoadIndex:(NSInteger)index {
+    return [self queueLoadIndex:index sourceIndex:-1];
 }
 
 - (NSString*)queueTitleAtIndex:(NSInteger)index {
-    if (index < 0 || index >= static_cast<NSInteger>(_paths.size())) {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
         return @"Untitled";
     }
     const std::string& t = _titles[index];
     if (!t.empty()) {
         return [NSString stringWithUTF8String:t.c_str()];
     }
-    NSString* path = [NSString stringWithUTF8String:_paths[index].c_str()];
+    const PlaylistEntry& song = _songs[static_cast<size_t>(index)];
+    NSString* path = song.sources.empty()
+        ? @""
+        : [NSString stringWithUTF8String:song.sources.front().c_str()];
     NSString* name = path.lastPathComponent.stringByDeletingPathExtension;
     return name.length > 0 ? name : @"Untitled";
 }
@@ -166,13 +258,18 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
         std::vector<std::string> sheets;
         collect_sheets(path.UTF8String, sheets);
         for (std::string& sheet : sheets) {
-            _paths.push_back(std::move(sheet));
+            const size_t previous_count = _songs.size();
+            add_playlist_path(_songs, std::move(sheet));
+            if (_songs.size() == previous_count) {
+                continue;
+            }
+            _selected_sources.push_back(0);
             _titles.emplace_back();
             _bpms.push_back(0);
             ++added;
         }
     }
-    if (added > 0) {
+    if (added > 0 || paths.count > 0) {
         [self persistPaths];
     }
     return added;
@@ -180,7 +277,7 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
 
 // Persist the playlist so it reloads on next launch (local hud-settings.json).
 - (void)persistPaths {
-    settings::set_string_array("playlist", _paths);
+    settings::set_string_array("playlist", flatten_playlist(_songs));
 }
 
 - (NSInteger)queueBpmAtIndex:(NSInteger)index {
@@ -188,6 +285,33 @@ void collect_sheets(const std::string& path, std::vector<std::string>& out) {
         return 0;
     }
     return _bpms[index];
+}
+
+- (NSInteger)queueSourceCountAtIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
+        return 0;
+    }
+    return static_cast<NSInteger>(_songs[static_cast<size_t>(index)].sources.size());
+}
+
+- (NSString*)queueSourceTitleAtIndex:(NSInteger)index sourceIndex:(NSInteger)sourceIndex {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
+        return @"";
+    }
+    const PlaylistEntry& song = _songs[static_cast<size_t>(index)];
+    if (sourceIndex < 0 || sourceIndex >= static_cast<NSInteger>(song.sources.size())) {
+        return @"";
+    }
+    NSString* path = [NSString stringWithUTF8String:
+        song.sources[static_cast<size_t>(sourceIndex)].c_str()];
+    return path.lastPathComponent ?: @"";
+}
+
+- (NSInteger)queueSelectedSourceIndexAtIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_selected_sources.size())) {
+        return 0;
+    }
+    return static_cast<NSInteger>(_selected_sources[static_cast<size_t>(index)]);
 }
 
 @end
@@ -209,7 +333,7 @@ int main(int argc, const char* argv[]) {
 
             if (inputs.empty() && !show_hud) {
                 std::cerr << "Usage: ./macauto.out [--no-hud] "
-                             "[<sheet.genshinsheet | folder> ...]\n"
+                             "[<sheet.genshinsheet | song.mid | folder> ...]\n"
                              "  HUD mode (default): launch with no args and "
                              "open songs from the HUD.\n"
                              "  --no-hud: requires at least one sheet path.\n";
@@ -221,7 +345,7 @@ int main(int argc, const char* argv[]) {
                 collect_sheets(in, sheets);
             }
             if (!inputs.empty() && sheets.empty()) {
-                std::cerr << "No .genshinsheet files found\n";
+                std::cerr << "No playable song files found\n";
                 return 1;
             }
 

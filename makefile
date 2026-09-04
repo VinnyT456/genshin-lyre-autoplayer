@@ -24,6 +24,7 @@ build:
 
 # make run                              # HUD, open songs from UI
 # make run SHEET="path/to/song.genshinsheet"
+# make run SHEET="path/to/song.mid"
 # make run SHEET="path/to/song.genshinsheet" NO_HUD=1
 run:
 ifdef NO_HUD

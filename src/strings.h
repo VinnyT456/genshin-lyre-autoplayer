@@ -34,6 +34,8 @@ enum class Str {
     // menu
     menu_autopause,
     menu_reset_speed,
+    menu_learn,
+    menu_restart_phrase,
     menu_theme,
     menu_language,
     menu_lang_english,
@@ -41,6 +43,9 @@ enum class Str {
     // open panel
     panel_message,
     panel_add,
+    learn_ready,
+    learn_note,
+    learn_complete,
 };
 
 namespace strings {

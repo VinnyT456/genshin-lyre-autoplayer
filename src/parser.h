@@ -11,7 +11,8 @@ using json = nlohmann::json;
 
 enum SongType {
     Composed,
-    Recorded
+    Recorded,
+    Midi
 };
 struct SongMetadata {
     string title;
@@ -41,6 +42,7 @@ public:
     json parse();
     vector<Note> translate_composed(json song);
     vector<Note> translate_recorded(json song);
+    vector<Note> translate_midi();
     vector<Note> translate();
     const SongMetadata& song_metadata() const;
 };

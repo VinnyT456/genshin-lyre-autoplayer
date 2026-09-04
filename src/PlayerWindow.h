@@ -15,9 +15,15 @@ class PlaybackController;
 // failure (bad file, empty sheet). On success the HUD reads the new title/bpm
 // via queueTitleAtIndex:/queueBpmAtIndex:.
 - (BOOL)queueLoadIndex:(NSInteger)index;
+- (BOOL)queueLoadIndex:(NSInteger)index sourceIndex:(NSInteger)sourceIndex;
 - (NSString*)queueTitleAtIndex:(NSInteger)index;
 - (NSInteger)queueBpmAtIndex:(NSInteger)index;
-// Append .genshinsheet files or folders; returns number of songs added.
+// A matching .genshinsheet/.mid pair is one playlist song with alternate
+// sources shown in its popup submenu.
+- (NSInteger)queueSourceCountAtIndex:(NSInteger)index;
+- (NSString*)queueSourceTitleAtIndex:(NSInteger)index sourceIndex:(NSInteger)sourceIndex;
+- (NSInteger)queueSelectedSourceIndexAtIndex:(NSInteger)index;
+// Append supported song files or folders; returns number of songs added.
 - (NSInteger)queueAddPaths:(NSArray<NSString*>*)paths;
 @end
 

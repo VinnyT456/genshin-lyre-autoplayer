@@ -18,8 +18,52 @@ const char* key_name(Key key) {
 
 }  // namespace
 
+void PlaybackController::rebuild_practice_phrases_locked() {
+    practice_phrases_.clear();
+    if (notes_.empty()) {
+        return;
+    }
+
+    std::vector<long long> gaps;
+    gaps.reserve(notes_.size() > 1 ? notes_.size() - 1 : 0);
+    for (std::size_t i = 1; i < notes_.size(); ++i) {
+        const long long gap = (notes_[i].timestamp - notes_[i - 1].timestamp).count();
+        if (gap > 0) {
+            gaps.push_back(gap);
+        }
+    }
+
+    long long typical_gap = 0;
+    if (!gaps.empty()) {
+        std::sort(gaps.begin(), gaps.end());
+        typical_gap = gaps[gaps.size() / 2];
+    }
+    // A phrase boundary is a noticeably longer rest than the song's normal
+    // note spacing. Keep a floor so fast passages do not split constantly.
+    const long long phrase_gap = std::max(750LL, typical_gap * 4);
+
+    std::size_t start = 0;
+    for (std::size_t i = 1; i < notes_.size(); ++i) {
+        const long long gap = (notes_[i].timestamp - notes_[i - 1].timestamp).count();
+        if (gap >= phrase_gap) {
+            practice_phrases_.push_back({start, i});
+            start = i;
+        }
+    }
+    practice_phrases_.push_back({start, notes_.size()});
+}
+
+void PlaybackController::reset_practice_locked() {
+    practice_phrase_index_ = 0;
+    practice_index_ = practice_phrases_.empty() ? 0 : practice_phrases_[0].first;
+    practice_pressed_.clear();
+}
+
 PlaybackController::PlaybackController(std::vector<Note> notes, Keyboard& keyboard)
-    : notes_(std::move(notes)), keyboard_(keyboard) {}
+    : notes_(std::move(notes)), keyboard_(keyboard) {
+    rebuild_practice_phrases_locked();
+    reset_practice_locked();
+}
 
 PlaybackController::~PlaybackController() {
     stop();
@@ -29,6 +73,17 @@ void PlaybackController::play() {
     std::unique_lock lock(mutex_);
     if (state_ == PlaybackState::playing || state_ == PlaybackState::countdown ||
         notes_.empty()) {
+        return;
+    }
+
+    if (practice_mode_) {
+        if (practice_index_ >= notes_.size()) {
+            reset_practice_locked();
+        }
+        practice_pressed_.clear();
+        stop_requested_ = false;
+        completed_ = false;
+        state_ = PlaybackState::playing;
         return;
     }
 
@@ -81,6 +136,9 @@ void PlaybackController::stop() {
         state_ = PlaybackState::stopped;
         completed_ = false;
         paused_elapsed_ = std::chrono::milliseconds(0);
+        if (practice_mode_) {
+            reset_practice_locked();
+        }
     }
     condition_.notify_all();
     if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id()) {
@@ -94,6 +152,30 @@ void PlaybackController::seek(std::chrono::milliseconds position) {
         return;
     }
     position = std::clamp(position, std::chrono::milliseconds(0), duration_locked());
+
+    if (practice_mode_) {
+        const double fraction = duration_locked().count() > 0
+            ? static_cast<double>(position.count()) / duration_locked().count()
+            : 0.0;
+        practice_index_ = std::min(
+            notes_.size(),
+            static_cast<std::size_t>(fraction * notes_.size()));
+        practice_phrase_index_ = 0;
+        for (std::size_t i = 0; i < practice_phrases_.size(); ++i) {
+            const auto [start, end] = practice_phrases_[i];
+            if (practice_index_ < end || i + 1 == practice_phrases_.size()) {
+                practice_phrase_index_ = i;
+                if (practice_index_ < start) {
+                    practice_index_ = start;
+                }
+                break;
+            }
+        }
+        practice_pressed_.clear();
+        completed_ = practice_index_ >= notes_.size();
+        seek_requested_ = false;
+        return;
+    }
 
     const auto now = std::chrono::steady_clock::now();
     origin_ = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -167,6 +249,8 @@ void PlaybackController::set_notes(std::vector<Note> notes) {
     stop();
     std::lock_guard lock(mutex_);
     notes_ = std::move(notes);
+    rebuild_practice_phrases_locked();
+    reset_practice_locked();
     completed_ = false;
     paused_elapsed_ = std::chrono::milliseconds(0);
 }
@@ -174,6 +258,71 @@ void PlaybackController::set_notes(std::vector<Note> notes) {
 void PlaybackController::set_countdown(std::chrono::milliseconds duration) {
     std::lock_guard lock(mutex_);
     countdown_ = std::max(std::chrono::milliseconds(0), duration);
+}
+
+void PlaybackController::set_practice_mode(bool enabled) {
+    stop();
+    std::lock_guard lock(mutex_);
+    practice_mode_ = enabled;
+    reset_practice_locked();
+}
+
+bool PlaybackController::practice_mode() const {
+    std::lock_guard lock(mutex_);
+    return practice_mode_;
+}
+
+PracticeInputResult PlaybackController::practice_key(Key key) {
+    std::lock_guard lock(mutex_);
+    if (!practice_mode_ || state_ != PlaybackState::playing ||
+        practice_index_ >= notes_.size()) {
+        return PracticeInputResult::ignored;
+    }
+
+    const std::vector<Key>& expected = notes_[practice_index_].keys;
+    if (std::find(expected.begin(), expected.end(), key) == expected.end()) {
+        return PracticeInputResult::wrong;
+    }
+    if (std::find(practice_pressed_.begin(), practice_pressed_.end(), key) ==
+        practice_pressed_.end()) {
+        practice_pressed_.push_back(key);
+    }
+    if (practice_pressed_.size() < expected.size()) {
+        return PracticeInputResult::partial;
+    }
+
+    practice_pressed_.clear();
+    ++practice_index_;
+    const auto [phrase_start, phrase_end] =
+        practice_phrases_[practice_phrase_index_];
+    if (practice_index_ < phrase_end) {
+        return PracticeInputResult::advanced;
+    }
+    if (loop_) {
+        practice_index_ = phrase_start;
+        return PracticeInputResult::phrase_completed;
+    }
+    if (practice_phrase_index_ + 1 < practice_phrases_.size()) {
+        ++practice_phrase_index_;
+        practice_index_ = practice_phrases_[practice_phrase_index_].first;
+        return PracticeInputResult::phrase_completed;
+    }
+    if (practice_index_ >= notes_.size()) {
+        state_ = PlaybackState::stopped;
+        completed_ = true;
+        return PracticeInputResult::completed;
+    }
+    return PracticeInputResult::phrase_completed;
+}
+
+void PlaybackController::practice_restart_phrase() {
+    std::lock_guard lock(mutex_);
+    if (!practice_mode_ || practice_phrases_.empty()) {
+        return;
+    }
+    practice_index_ = practice_phrases_[practice_phrase_index_].first;
+    practice_pressed_.clear();
+    completed_ = false;
 }
 
 std::size_t PlaybackController::note_count() const {
@@ -187,6 +336,12 @@ std::chrono::milliseconds PlaybackController::duration_locked() const {
 
 std::chrono::milliseconds PlaybackController::elapsed_locked() const {
     const auto duration = duration_locked();
+    if (practice_mode_) {
+        if (practice_index_ >= notes_.size()) {
+            return duration;
+        }
+        return notes_[practice_index_].timestamp;
+    }
     std::chrono::milliseconds elapsed{0};
     const auto now = std::chrono::steady_clock::now();
     if (state_ == PlaybackState::playing) {
@@ -209,15 +364,27 @@ PlaybackSnapshot PlaybackController::snapshot() const {
     const auto duration = duration_locked();
     const auto elapsed = elapsed_locked();
 
-    const double progress = duration.count() > 0
-        ? static_cast<double>(elapsed.count()) / duration.count()
-        : 0.0;
+    const double progress = practice_mode_ && !notes_.empty()
+        ? static_cast<double>(practice_index_) / notes_.size()
+        : duration.count() > 0
+            ? static_cast<double>(elapsed.count()) / duration.count()
+            : 0.0;
 
     std::string current;
     std::string next;
     std::vector<Key> active_keys;
 
-    if (!notes_.empty()) {
+    if (!notes_.empty() && practice_mode_) {
+        if (practice_index_ < notes_.size()) {
+            current = describe(notes_[practice_index_].keys);
+            if (practice_index_ + 1 < notes_.size()) {
+                next = describe(notes_[practice_index_ + 1].keys);
+            }
+            if (state_ == PlaybackState::playing || state_ == PlaybackState::paused) {
+                active_keys = notes_[practice_index_].keys;
+            }
+        }
+    } else if (!notes_.empty()) {
         std::size_t index = 0;
         for (std::size_t i = 0; i < notes_.size(); ++i) {
             if (notes_[i].timestamp <= elapsed) {
@@ -246,7 +413,8 @@ PlaybackSnapshot PlaybackController::snapshot() const {
     }
 
     return {state_, elapsed, duration, progress, current, next,
-            std::move(active_keys), loop_, speed_, countdown_remaining};
+            std::move(active_keys), practice_phrase_index_,
+            practice_phrases_.size(), loop_, speed_, countdown_remaining};
 }
 
 void PlaybackController::run() {

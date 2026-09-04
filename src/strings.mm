@@ -33,12 +33,17 @@ const std::unordered_map<Str, NSString*>& table_en() {
         {Str::tip_playlist,     @"Playlist"},
         {Str::menu_autopause,   @"Auto-pause when Genshin loses focus"},
         {Str::menu_reset_speed, @"Reset speed to 1×"},
+        {Str::menu_learn,       @"Learn mode"},
+        {Str::menu_restart_phrase, @"Restart phrase"},
         {Str::menu_theme,       @"Theme"},
         {Str::menu_language,    @"Language"},
         {Str::menu_lang_english,@"English"},
         {Str::menu_lang_chinese,@"中文"},
-        {Str::panel_message,    @"Choose .genshinsheet files or folders"},
+        {Str::panel_message,    @"Choose .genshinsheet or .mid/.midi files or folders"},
         {Str::panel_add,        @"Add"},
+        {Str::learn_ready,      @"Learn mode — press play to begin"},
+        {Str::learn_note,       @"Play %@"},
+        {Str::learn_complete,   @"Song learned — press play to try again"},
     };
     return t;
 }
@@ -69,12 +74,17 @@ const std::unordered_map<Str, NSString*>& table_zh() {
         {Str::tip_playlist,     @"播放列表"},
         {Str::menu_autopause,   @"原神失去焦点时自动暂停"},
         {Str::menu_reset_speed, @"重置速度为 1×"},
+        {Str::menu_learn,       @"练习模式"},
+        {Str::menu_restart_phrase, @"重新练习乐句"},
         {Str::menu_theme,       @"主题"},
         {Str::menu_language,    @"语言"},
         {Str::menu_lang_english,@"English"},
         {Str::menu_lang_chinese,@"中文"},
-        {Str::panel_message,    @"选择 .genshinsheet 文件或文件夹"},
+        {Str::panel_message,    @"选择 .genshinsheet 或 .mid/.midi 文件或文件夹"},
         {Str::panel_add,        @"添加"},
+        {Str::learn_ready,      @"练习模式 — 点击播放开始"},
+        {Str::learn_note,       @"演奏 %@"},
+        {Str::learn_complete,   @"已完成练习 — 点击播放再来一次"},
     };
     return t;
 }

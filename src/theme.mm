@@ -15,7 +15,7 @@ std::vector<Theme> make_all() {
     // orange than a flat yellow — over a deep warm-brown black, with hood-white
     // ink.
     list.push_back(Theme{
-        "naberius", "Naberius (radiant gold)", "那贝流士（辉耀金）",
+        "naberius", "Naberius (radiant gold)", "纳贝里士（辉耀金）",
         srgb(1.00, 0.72, 0.25, 1.0),   // accent  (halo gold, warm orange lean)
         srgb(1.00, 0.72, 0.25, 0.5),   // accent_dim
         srgb(1.00, 0.99, 0.96, 1.0),   // ink     (hood white, near-neutral)
@@ -37,7 +37,7 @@ std::vector<Theme> make_all() {
     // reads as light, not paint); the ground is a deep oxblood-black and the
     // ink carries a faint rose cast picked up from her hair in that red light.
     list.push_back(Theme{
-        "ronova", "Ronova (crimson)", "洛诺瓦（绯红）",
+        "ronova", "Ronova (crimson)", "若娜瓦（绯红）",
         srgb(0.92, 0.15, 0.20, 1.0),   // accent  (glowing scarlet)
         srgb(0.92, 0.15, 0.20, 0.5),   // accent_dim
         srgb(0.95, 0.95, 0.96, 1.0),   // ink     (cool silver-white)

@@ -118,21 +118,16 @@ void Keyboard::press(vector<Key> keys) {
     // playback scheduler already determines the intended note time.
     sleep_ms(human_delay_ms(5.0, 2.5, 1, 12));
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        keyDown(keys[i]);
-        if (i + 1 < keys.size()) {
-            // Fingers in a chord rarely land on the exact same millisecond.
-            sleep_ms(human_delay_ms(3.0, 1.5, 1, 7));
-        }
+    // A chord is one musical event. Post every key-down in one tight cluster
+    // so the game receives the notes together instead of as a short arpeggio.
+    for (Key key : keys) {
+        keyDown(key);
     }
 
     // Most taps sit near 45 ms, with occasional shorter or longer presses.
     sleep_ms(human_delay_ms(45.0, 10.0, 26, 72));
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        keyUp(keys[i]);
-        if (i + 1 < keys.size()) {
-            sleep_ms(human_delay_ms(2.5, 1.2, 1, 6));
-        }
+    for (Key key : keys) {
+        keyUp(key);
     }
 }

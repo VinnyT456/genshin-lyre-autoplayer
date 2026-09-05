@@ -15,13 +15,14 @@
 #include "keyboard.h"
 #include "key.h"
 #include "playback_controller.h"
+#include "practice_dashboard.h"
 #include "settings.h"
 #include "strings.h"
 #include "theme.h"
 
 namespace {
 
-constexpr CGFloat kW = 278.0;
+constexpr CGFloat kW = 260.0;
 constexpr CGFloat kH = 252.0;       // expanded height
 constexpr CGFloat kMiniH = 62.0;    // collapsed: header only
 // Gap from game window edges (top-right dock).
@@ -31,6 +32,7 @@ constexpr CGFloat kRightInset = 56.0;
 constexpr const char* kSettingCollapsed = "collapsed";
 constexpr const char* kSettingAutoPause = "auto_pause_on_blur";
 constexpr const char* kSettingLearn = "learn_mode";
+constexpr const char* kSettingTempoPractice = "tempo_practice";
 constexpr const char* kSettingTheme = "theme";
 constexpr const char* kSettingLang = "language";
 
@@ -356,6 +358,7 @@ NSPoint top_right_hud_origin(NSRect game, CGFloat hud_height) {
 @property(nonatomic, assign) Keyboard* keyboard;
 @property(nonatomic, weak) id practiceTarget;
 @property(nonatomic) SEL practiceAction;
+@property(nonatomic) BOOL practiceMode;
 - (void)setActiveKeys:(const std::vector<Key>&)keys;
 - (void)setPreviewKeys:(const std::vector<Key>&)keys;  // faint hint when idle
 @end
@@ -495,12 +498,20 @@ static const char* kNames[3][7] = {
     if (_keyboard == nullptr) {
         return;
     }
+    // A drag generates many mouse events over the same cell. Treat the held
+    // key as one input so practice mode cannot advance twice from one click.
+    if (_held.has_value() && *_held == key) {
+        return;
+    }
     if (_held.has_value() && *_held != key) {
         _keyboard->keyUp(*_held);
     }
     _held = key;
     _pulse[static_cast<std::size_t>(key)] = 1.0;
-    _keyboard->keyDown(key);
+
+    // Recognize the practice input before posting to Genshin. If the target
+    // process needs activating, posting can briefly block; the learning cue
+    // should still advance immediately for the person clicking the HUD.
     if (_practiceTarget != nil && _practiceAction != nullptr &&
         [_practiceTarget respondsToSelector:_practiceAction]) {
         NSMethodSignature* signature = [_practiceTarget methodSignatureForSelector:_practiceAction];
@@ -513,6 +524,7 @@ static const char* kNames[3][7] = {
             [invocation invoke];
         }
     }
+    _keyboard->keyDown(key);
     self.needsDisplay = YES;
 }
 
@@ -565,6 +577,7 @@ static const char* kNames[3][7] = {
                                                                 yRadius:radius];
 
             const BOOL preview = (lit <= 0.0) && [self isPreview:key];
+            const BOOL practicePreview = preview && _practiceMode;
 
             if (lit > 0.0) {
                 // Keep the idle face underneath so a fading key dims back into
@@ -586,13 +599,18 @@ static const char* kNames[3][7] = {
                 [[g colorWithAlphaComponent:lit] setFill];
                 [face fill];
             } else if (preview) {
-                // Resting hint: the first note's keys glow faintly and breathe,
-                // so the hero never reads as a dead grid.
-                const double b = 0.10 + 0.06 * (0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI));
+                // Resting hint: practice targets are intentionally stronger
+                // than the normal idle preview, but still use the current
+                // theme's accent so they do not introduce a new visual style.
+                const double b = practicePreview
+                    ? 0.20 + 0.08 * (0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI))
+                    : 0.10 + 0.06 * (0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI));
                 [[g colorWithAlphaComponent:b] setFill];
                 [face fill];
-                [[g colorWithAlphaComponent:0.35] setStroke];
-                face.lineWidth = themes::current().key_stroke;
+                [[g colorWithAlphaComponent:practicePreview ? 0.78 : 0.35] setStroke];
+                face.lineWidth = practicePreview
+                    ? themes::current().key_stroke * 1.5
+                    : themes::current().key_stroke;
                 [face stroke];
             } else {
                 // Idle: near-invisible fill, plus a per-theme edge. The stroke
@@ -612,12 +630,15 @@ static const char* kNames[3][7] = {
             // carry it; below that, blend back toward the normal label color.
             NSColor* text = lit > 0.55
                 ? on_accent()
-                : (preview ? [g colorWithAlphaComponent:0.75]
+                : (preview ? [g colorWithAlphaComponent:practicePreview ? 0.95 : 0.75]
                            : [ink_faint() blendedColorWithFraction:lit
                                                            ofColor:on_accent()]);
             NSDictionary* attrs = @{
                 NSFontAttributeName:
-                    [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightSemibold],
+                    [NSFont monospacedSystemFontOfSize:11
+                                                  weight:practicePreview
+                                                      ? NSFontWeightBold
+                                                      : NSFontWeightSemibold],
                 NSForegroundColorAttributeName: text
             };
             const NSString* label = [NSString stringWithUTF8String:kNames[row][col]];
@@ -989,7 +1010,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
            sourceIndex:(NSInteger)sourceIndex
               autoplay:(BOOL)autoplay;
 - (void)practiceKeyPressed:(NSNumber*)value;
+- (void)toggleTempoPractice:(id)sender;
 - (void)restartPracticePhrase:(id)sender;
+- (void)showPracticeDashboard:(id)sender;
 @end
 
 @implementation PlayerWindowController {
@@ -1021,6 +1044,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSButton* _speedButton;
     MiniProgress* _miniProgress;   // thin bar shown when collapsed
     NSTimer* _uiTimer;
+    PracticeDashboardController* _practiceDashboard;
     id _hotkeyMonitor;
     CGFloat _target_alpha;
     pid_t _genshin_pid;
@@ -1081,6 +1105,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
     _playback->set_countdown(std::chrono::milliseconds(3000));
     _playback->set_practice_mode(settings::get_bool(kSettingLearn, false));
+    _playback->set_practice_tempo(settings::get_bool(kSettingTempoPractice, false));
 
     // Auto-advance to the next queued song when one finishes naturally.
     __weak PlayerWindowController* weak = self;
@@ -1202,6 +1227,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     // ---- Hero: the lyre grid, large. ----
     _key_grid = [[LyreKeyGridView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 96)];
     _key_grid.keyboard = keyboard;
+    _key_grid.practiceMode = _playback->practice_mode();
     _key_grid.practiceTarget = self;
     _key_grid.practiceAction = @selector(practiceKeyPressed:);
     _key_grid.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1452,6 +1478,18 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
+- (void)showPracticeDashboard:(id)sender {
+    if (_practiceDashboard == nil) {
+        _practiceDashboard = [[PracticeDashboardController alloc]
+            initWithPlayback:_playback];
+        [_practiceDashboard.window center];
+    }
+    [_practiceDashboard setSongKey:_titleLabel.stringValue];
+    [_practiceDashboard refresh];
+    [_practiceDashboard showWindow:self];
+    [_practiceDashboard.window orderFrontRegardless];
+}
+
 - (void)seekTo:(NSNumber*)fraction {
     _playback->seek_fraction(fraction.doubleValue);
     [self refresh];
@@ -1512,6 +1550,17 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
+- (void)toggleTempoPractice:(id)sender {
+    const BOOL enabled = !_playback->practice_tempo();
+    if (!_playback->practice_mode()) {
+        _playback->set_practice_mode(true);
+        settings::set_bool(kSettingLearn, true);
+    }
+    _playback->set_practice_tempo(enabled);
+    settings::set_bool(kSettingTempoPractice, enabled);
+    [self refresh];
+}
+
 - (NSMenu*)panelContextMenu {
     NSMenu* menu = [[NSMenu alloc] init];
 
@@ -1530,6 +1579,16 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:learn];
 
+    NSMenuItem* tempo = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_tempo_practice)
+               action:@selector(toggleTempoPractice:)
+        keyEquivalent:@""];
+    tempo.target = self;
+    tempo.state = _playback->practice_tempo()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    tempo.enabled = _playback->practice_mode();
+    [menu addItem:tempo];
+
     NSMenuItem* restartPhrase = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_restart_phrase)
                action:@selector(restartPracticePhrase:)
@@ -1537,6 +1596,14 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     restartPhrase.target = self;
     restartPhrase.enabled = _playback->practice_mode();
     [menu addItem:restartPhrase];
+
+    NSMenuItem* insights = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_practice_insights)
+               action:@selector(showPracticeDashboard:)
+        keyEquivalent:@""];
+    insights.target = self;
+    insights.enabled = _playback->practice_mode();
+    [menu addItem:insights];
 
     NSMenuItem* reset = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_reset_speed)
                                                    action:@selector(resetSpeed:)
@@ -2176,9 +2243,11 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)refresh {
+    _playback->practice_tick();
     const PlaybackSnapshot s = _playback->snapshot();
     [_key_grid decayPulse];
     [_statusPill tick];
+    _key_grid.practiceMode = _playback->practice_mode();
 
     _progress.progress = s.progress;
     _miniProgress.progress = s.progress;
@@ -2187,6 +2256,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _time.stringValue = format_time(s.elapsed);
     _duration.stringValue = format_time(s.duration);
     [_key_grid setActiveKeys:s.active_keys];
+    if (_practiceDashboard != nil) {
+        [_practiceDashboard setSongKey:_titleLabel.stringValue];
+    }
 
     // Idle hint: when stopped with a song loaded, glow the current note's keys
     // faintly so the grid has life at rest.
@@ -2244,14 +2316,42 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
             static_cast<unsigned long>(s.practice_phrase_index + 1),
             static_cast<unsigned long>(s.practice_phrase_count)]
         : @"";
+    NSString* practiceFeedback = nil;
+    switch (s.practice_feedback) {
+        case PracticeInputResult::wrong:
+            practiceFeedback = strings::get(Str::learn_wrong);
+            break;
+        case PracticeInputResult::partial:
+            practiceFeedback = s.practice_expected_count > 0
+                ? [NSString stringWithFormat:@"%@ %lu/%lu",
+                    strings::get(Str::learn_partial),
+                    static_cast<unsigned long>(s.practice_pressed_count),
+                    static_cast<unsigned long>(s.practice_expected_count)]
+                : strings::get(Str::learn_partial);
+            break;
+        case PracticeInputResult::early:
+            practiceFeedback = strings::get(Str::learn_early);
+            break;
+        case PracticeInputResult::late:
+            practiceFeedback = strings::get(Str::learn_late);
+            break;
+        case PracticeInputResult::missed:
+            practiceFeedback = strings::get(Str::learn_missed);
+            break;
+        default:
+            break;
+    }
     if (_playback->practice_mode() && s.state == PlaybackState::playing) {
         _hint.textColor = gold();
-        _hint.stringValue = s.current_note.empty()
-            ? strings::get(Str::learn_complete)
-            : [NSString stringWithFormat:@"%@ · %@",
-                phraseLabel,
-                [NSString stringWithFormat:strings::get(Str::learn_note),
-                    [NSString stringWithUTF8String:s.current_note.c_str()]]];
+        if (s.current_note.empty()) {
+            _hint.stringValue = strings::get(Str::learn_complete);
+        } else {
+            NSString* cue = [NSString stringWithFormat:strings::get(Str::learn_note),
+                [NSString stringWithUTF8String:s.current_note.c_str()]];
+            _hint.stringValue = practiceFeedback != nil
+                ? [NSString stringWithFormat:@"%@ · %@", practiceFeedback, cue]
+                : [NSString stringWithFormat:@"%@ · %@", phraseLabel, cue];
+        }
     } else if (_playback->practice_mode() && s.state == PlaybackState::paused) {
         _hint.textColor = ink_soft();
         _hint.stringValue = s.current_note.empty()

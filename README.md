@@ -35,7 +35,7 @@ If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo
 - **Docks to Genshin.** Starts at the game window's top-right and follows it as it moves; drag it anywhere and it keeps your spot. Hides when Genshin isn't frontmost.
 - **Plays songs for you.** Open one or many `.genshinsheet`, `.mid`, or `.midi` files (or a folder) as a playlist. Matching sheet and MIDI files in the same folder are grouped as one song, with the alternate source available from the song picker. Play / pause / stop, seek, loop, and change speed.
 - **Shows what it's doing.** The 21-key lyre grid lights up in real time; a progress bar and a pulsing status dot track playback.
-- **Helps you learn.** Learn mode breaks a song into phrase-sized groups, highlights the expected note or chord, and advances only when you play it from the keyboard or HUD, without automatic playback. Use the gear menu to restart the current phrase; Loop repeats that phrase instead of the entire song.
+- **Helps you learn.** Learn mode breaks a song into phrase-sized groups, highlights the expected note or chord, and advances only when you play it from the keyboard or HUD, without automatic playback. Turn on **Practice at song speed** from the gear menu to follow the song's timestamps with early, late, and missed-note feedback. Use the gear menu to restart the current phrase or open Practice Insights, which tracks note accuracy, wrong keys, partial chords, response time, phrase repetitions, phrase mastery, your best accuracy, and the weakest phrase to revisit. Progress is saved locally per song title. Loop repeats that phrase instead of the entire song.
 - **Plays by hand too.** Click keys on the HUD grid to send that note to Genshin yourself.
 - **Feels human.** Variable key-hold and chord stagger, a 3-second count-in before it starts, and auto-advance to the next song.
 - **Stays targeted.** Keystrokes are posted only to the Genshin process (`CGEventPostToPid`) — nothing is injected into the game.
@@ -84,6 +84,8 @@ Import it in PlayCover's keymapping for Genshin, then equip the lyre in-game.
 | Speed button | Click to cycle presets (0.5× → 2×); scroll over the HUD for fine steps (0.25×–3×) |
 | Click a lyre key | Send that note to Genshin manually |
 | Learn mode (gear menu) | Practice the current song note-by-note; automatic playback is disabled |
+| Practice at song speed (Learn menu) | Follow the song's timing at the selected speed with early/late/missed feedback |
+| Practice Insights (Learn menu) | View session accuracy, response time, chord stats, and phrase-by-phrase progress |
 | Restart phrase (gear menu / `⌘↩`) | Return to the beginning of the current inferred phrase |
 | `+` (header) | Add more songs to the playlist |
 | Chevron | Collapse to a mini bar |
@@ -114,7 +116,7 @@ Quote paths that contain spaces or `()`. The playlist is remembered between laun
 
 ### Local settings
 
-HUD state — the playlist, collapsed toggle, and auto-pause preference — is saved to **`hud-settings.json` next to the binary** (the project root), not in macOS preferences. It's per-user and machine-local: nothing is shared or committed (the file is git-ignored), so it never carries your songs to anyone else. Delete the file to reset.
+HUD state — the playlist, collapsed toggle, auto-pause preference, and practice dashboard history — is saved to **`hud-settings.json` next to the binary** (the project root), not in macOS preferences. Practice history is stored under the native `practice_history` JSON object. It's per-user and machine-local: nothing is shared or committed (the file is git-ignored), so it never carries your songs to anyone else. Delete the file to reset.
 
 ## Accessibility (required — no keys without it)
 

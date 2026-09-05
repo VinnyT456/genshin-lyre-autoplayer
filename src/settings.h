@@ -17,6 +17,11 @@ void set_bool(const std::string& key, bool value);
 std::string get_string(const std::string& key, const std::string& fallback);
 void set_string(const std::string& key, const std::string& value);
 
+// JSON-shaped values stored as native objects/arrays. The getter also accepts
+// the legacy escaped-string representation so settings migrate on save.
+std::string get_json(const std::string& key, const std::string& fallback);
+void set_json(const std::string& key, const std::string& value);
+
 std::vector<std::string> get_string_array(const std::string& key);
 void set_string_array(const std::string& key, const std::vector<std::string>& value);
 

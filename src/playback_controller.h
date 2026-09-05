@@ -19,9 +19,39 @@ enum class PracticeInputResult {
     ignored,
     wrong,
     partial,
+    early,
+    late,
+    missed,
     advanced,
     phrase_completed,
     completed
+};
+
+struct PracticePhraseSnapshot {
+    std::size_t note_count = 0;
+    std::size_t completed_notes = 0;
+    std::size_t wrong_keys = 0;
+    std::size_t partial_chords = 0;
+    std::size_t repetitions = 0;
+    std::size_t clean_repetitions = 0;
+    double accuracy = 0.0;
+    double best_accuracy = 0.0;
+    bool mastered = false;
+};
+
+struct PracticeStatsSnapshot {
+    std::size_t notes_completed = 0;
+    std::size_t wrong_keys = 0;
+    std::size_t partial_chords = 0;
+    std::size_t chords_completed = 0;
+    std::size_t phrases_completed = 0;
+    double accuracy = 0.0;
+    std::chrono::milliseconds average_response{0};
+    std::chrono::milliseconds last_response{0};
+    std::vector<PracticePhraseSnapshot> phrases;
+    std::size_t early_inputs = 0;
+    std::size_t late_inputs = 0;
+    std::size_t missed_notes = 0;
 };
 
 struct PlaybackSnapshot {
@@ -34,6 +64,10 @@ struct PlaybackSnapshot {
     std::vector<Key> active_keys;
     std::size_t practice_phrase_index;
     std::size_t practice_phrase_count;
+    PracticeInputResult practice_feedback;
+    std::size_t practice_pressed_count;
+    std::size_t practice_expected_count;
+    PracticeStatsSnapshot practice_stats;
     bool loop;                                        // whole-song loop enabled
     double speed;                                     // playback rate multiplier
     std::chrono::milliseconds countdown_remaining;    // > 0 while counting in
@@ -69,6 +103,9 @@ public:
     // key or chord. It never posts automatic keystrokes.
     void set_practice_mode(bool enabled);
     bool practice_mode() const;
+    void set_practice_tempo(bool enabled);
+    bool practice_tempo() const;
+    void practice_tick();
     PracticeInputResult practice_key(Key key);
     void practice_restart_phrase();
 
@@ -87,6 +124,7 @@ private:
     static std::string describe(const std::vector<Key>& keys);
     std::chrono::milliseconds duration_locked() const;
     std::chrono::milliseconds elapsed_locked() const;
+    std::chrono::milliseconds practice_tempo_elapsed_locked() const;
 
     std::vector<Note> notes_;
     Keyboard& keyboard_;
@@ -108,9 +146,33 @@ private:
     std::size_t practice_phrase_index_ = 0;
     std::vector<std::pair<std::size_t, std::size_t>> practice_phrases_;
     std::vector<Key> practice_pressed_;
+    std::vector<PracticePhraseSnapshot> practice_stats_;
+    std::size_t practice_clean_repetitions_ = 0;
+    std::size_t practice_rep_completed_ = 0;
+    std::size_t practice_rep_wrong_ = 0;
+    std::size_t practice_rep_partial_ = 0;
+    std::size_t practice_notes_completed_ = 0;
+    std::size_t practice_wrong_keys_ = 0;
+    std::size_t practice_partial_chords_ = 0;
+    std::size_t practice_chords_completed_ = 0;
+    std::size_t practice_phrases_completed_ = 0;
+    std::size_t practice_early_inputs_ = 0;
+    std::size_t practice_late_inputs_ = 0;
+    std::size_t practice_missed_notes_ = 0;
+    std::chrono::milliseconds practice_response_total_{0};
+    std::chrono::milliseconds practice_last_response_{0};
+    std::chrono::steady_clock::time_point practice_target_started_at_;
+    bool practice_tempo_ = false;
+    bool practice_late_current_ = false;
+    PracticeInputResult practice_feedback_ = PracticeInputResult::ignored;
     double speed_ = 1.0;
     std::function<void()> on_finished_;
 
     void rebuild_practice_phrases_locked();
     void reset_practice_locked();
+    void reset_practice_stats_locked();
+    void start_practice_target_locked();
+    PracticeInputResult advance_practice_note_locked(
+        bool completed, PracticeInputResult feedback,
+        std::chrono::steady_clock::time_point now);
 };

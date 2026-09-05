@@ -91,6 +91,35 @@ void set_string(const std::string& key, const std::string& value) {
     save_locked(j);
 }
 
+std::string get_json(const std::string& key, const std::string& fallback) {
+    std::lock_guard lock(g_mutex);
+    const nlohmann::json j = load_locked();
+    if (!j.contains(key)) {
+        return fallback;
+    }
+    if (j[key].is_object() || j[key].is_array()) {
+        return j[key].dump();
+    }
+    if (j[key].is_string()) {
+        // Accept the pre-object format written by older dashboard builds.
+        return j[key].get<std::string>();
+    }
+    return fallback;
+}
+
+void set_json(const std::string& key, const std::string& value) {
+    std::lock_guard lock(g_mutex);
+    nlohmann::json parsed;
+    try {
+        parsed = nlohmann::json::parse(value);
+    } catch (...) {
+        return;
+    }
+    nlohmann::json j = load_locked();
+    j[key] = std::move(parsed);
+    save_locked(j);
+}
+
 std::vector<std::string> get_string_array(const std::string& key) {
     std::lock_guard lock(g_mutex);
     const nlohmann::json j = load_locked();

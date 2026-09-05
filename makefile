@@ -8,7 +8,7 @@ FRAMEWORKS = -framework Foundation -framework AppKit -framework CoreGraphics \
 TARGET = macauto.out
 SRC = src/main.mm src/PlayerWindow.mm src/keyboard.mm src/genshin.mm \
 	src/parser.cpp src/playback_controller.cpp src/settings.cpp \
-	src/theme.mm src/strings.mm
+	src/theme.mm src/strings.mm src/practice_dashboard.mm
 
 NLOHMANN_INCLUDE ?= $(firstword $(wildcard /opt/homebrew/include /usr/local/include))
 ifneq ($(NLOHMANN_INCLUDE),)

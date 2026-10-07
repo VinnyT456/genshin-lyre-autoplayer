@@ -11,6 +11,8 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <ApplicationServices/ApplicationServices.h>
 
+#include <nlohmann/json.hpp>
+
 #include "genshin.h"
 #include "keyboard.h"
 #include "key.h"
@@ -31,8 +33,53 @@ constexpr CGFloat kRightInset = 56.0;
 // Local settings keys (hud-settings.json next to the binary).
 constexpr const char* kSettingCollapsed = "collapsed";
 constexpr const char* kSettingAutoPause = "auto_pause_on_blur";
+constexpr const char* kSettingPlayInBackground = "play_in_background";
 constexpr const char* kSettingLearn = "learn_mode";
 constexpr const char* kSettingTempoPractice = "tempo_practice";
+constexpr const char* kSettingAutoSpeed = "practice_auto_speed";
+constexpr const char* kSettingLockMastered = "practice_lock_until_mastered";
+constexpr const char* kSettingRampStart = "practice_ramp_start_pct";   // 0 = current speed
+constexpr const char* kSettingDifficulty = "practice_difficulty";      // 0 easy, 1 normal, 2 strict
+constexpr const char* kSettingShowSummary = "practice_show_summary";
+
+// Timing windows for each practice difficulty. Strict also caps chord
+// assembly so both keys of a chord must land close together.
+PracticeTimingWindows timing_windows_for_difficulty(NSInteger difficulty) {
+    PracticeTimingWindows windows;
+    switch (difficulty) {
+        case 0:  // Easy
+            windows.early = std::chrono::milliseconds(350);
+            windows.miss = std::chrono::milliseconds(700);
+            break;
+        case 2:  // Strict
+            windows.early = std::chrono::milliseconds(120);
+            windows.miss = std::chrono::milliseconds(250);
+            windows.chord = std::chrono::milliseconds(120);
+            break;
+        default:  // Normal (the historical defaults)
+            break;
+    }
+    return windows;
+}
+constexpr const char* kSettingShowUpcoming = "practice_show_upcoming";
+constexpr const char* kSettingCountIn = "count_in_seconds";
+constexpr const char* kSettingLatencyOffset = "practice_latency_offset_ms";
+constexpr const char* kSettingReducedMotion = "reduced_motion";
+constexpr const char* kSettingMetronome = "practice_metronome";        // legacy bool
+constexpr const char* kSettingMetronomeMode = "practice_metronome_mode"; // 0 off, 1 cues, 2 beat
+
+// One stop in a "drill weakest phrases" run: a playlist song and one of its
+// inferred phrases, with the best accuracy that made it a drill candidate.
+struct DrillItem {
+    NSInteger song;
+    std::size_t phrase;
+    double best;
+};
+constexpr std::size_t kDrillLength = 5;
+// Phrases at or above this best accuracy are considered solid, not drilled.
+constexpr double kDrillThreshold = 0.95;
+constexpr const char* kSettingHighContrast = "high_contrast";
+constexpr const char* kSettingFavoritesOnly = "favorites_only";
 constexpr const char* kSettingTheme = "theme";
 constexpr const char* kSettingLang = "language";
 
@@ -113,14 +160,25 @@ NSImage* tinted_symbol(NSString* name, CGFloat size, NSFontWeight weight, NSColo
     return tinted;
 }
 
-// Resolve the Genshin process id, or 0 if not running.
-pid_t genshin_pid() {
-    for (NSRunningApplication* app in NSWorkspace.sharedWorkspace.runningApplications) {
-        if ([app.localizedName isEqualToString:@"Genshin Impact"]) {
-            return app.processIdentifier;
+bool contains_genshin(NSString* value) {
+    if (value == nil) {
+        return false;
+    }
+    // Match the global client plus the CN release, whose app / window name is
+    // "YuanShen" / "原神" and contains none of the string "genshin".
+    for (NSString* needle in @[@"genshin", @"yuanshen", @"原神"]) {
+        if ([value rangeOfString:needle
+                         options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return true;
         }
     }
-    return 0;
+    return false;
+}
+
+// Resolve the Genshin process id, or 0 if not running. Shared with the
+// keyboard so the HUD's focus checks and the keystroke target always agree.
+pid_t genshin_pid() {
+    return find_genshin_pid();
 }
 
 bool genshin_is_focused(pid_t pid) {
@@ -129,7 +187,12 @@ bool genshin_is_focused(pid_t pid) {
     }
     NSRunningApplication* app =
         [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-    return app != nil && app.isActive;
+    if (app == nil) {
+        return false;
+    }
+    NSRunningApplication* frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    return app.isActive ||
+        (frontmost != nil && frontmost.processIdentifier == pid);
 }
 
 // Convert a CoreGraphics window rect (global, top-left origin) into AppKit
@@ -176,10 +239,11 @@ std::optional<NSRect> game_frame(pid_t pid, CGWindowID* out_number) {
             if (owner_pid != pid) {
                 return;
             }
-            if (require_name && ![window_name isEqualToString:@"Genshin Impact"]) {
+            if (require_name && !contains_genshin(window_name)) {
                 return;
             }
-        } else if (![window_name isEqualToString:@"Genshin Impact"]) {
+        } else if (!contains_genshin(window_name) &&
+                   !contains_genshin(window[(id)kCGWindowOwnerName])) {
             return;
         }
 
@@ -271,6 +335,22 @@ NSPoint top_right_hud_origin(NSRect game, CGFloat hud_height) {
     return YES;
 }
 
+- (BOOL)isAccessibilityElement {
+    return YES;
+}
+
+- (NSString*)accessibilityRole {
+    return NSAccessibilityGroupRole;
+}
+
+- (NSString*)accessibilityLabel {
+    return @"Lyre key grid";
+}
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
 - (void)setProgress:(double)progress {
     _progress = std::clamp(progress, 0.0, 1.0);
     self.needsDisplay = YES;
@@ -359,8 +439,11 @@ NSPoint top_right_hud_origin(NSRect game, CGFloat hud_height) {
 @property(nonatomic, weak) id practiceTarget;
 @property(nonatomic) SEL practiceAction;
 @property(nonatomic) BOOL practiceMode;
+@property(nonatomic) BOOL reducedMotion;
+@property(nonatomic) BOOL highContrast;
 - (void)setActiveKeys:(const std::vector<Key>&)keys;
 - (void)setPreviewKeys:(const std::vector<Key>&)keys;  // faint hint when idle
+- (void)releaseHeldKey;
 @end
 
 @implementation LyreKeyGridView {
@@ -429,10 +512,13 @@ static const char* kNames[3][7] = {
             any = YES;
         }
     }
-    // Ambient shimmer for the previewed keys; always animating (subtle).
-    _shimmer += 0.03;
-    if (_shimmer > 1.0) {
-        _shimmer -= 1.0;
+    // Ambient shimmer is optional so the HUD can remain calm for motion-
+    // sensitive users.
+    if (!_reducedMotion) {
+        _shimmer += 0.03;
+        if (_shimmer > 1.0) {
+            _shimmer -= 1.0;
+        }
     }
     if (!_preview.empty()) {
         any = YES;
@@ -528,7 +614,21 @@ static const char* kNames[3][7] = {
     self.needsDisplay = YES;
 }
 
+- (void)keyDown:(NSEvent*)event {
+    const std::optional<Key> key = key_from_event(event);
+    if (key.has_value()) {
+        [self pressKey:key.value()];
+        return;
+    }
+    [super keyDown:event];
+}
+
+- (void)keyUp:(NSEvent*)event {
+    [self releaseHeldKey];
+}
+
 - (void)mouseDown:(NSEvent*)event {
+    [self.window makeFirstResponder:self];
     const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
     const std::optional<Key> key = [self keyAtPoint:p];
     if (key.has_value()) {
@@ -583,7 +683,7 @@ static const char* kNames[3][7] = {
                 // Keep the idle face underneath so a fading key dims back into
                 // the grid instead of settling on a muddy mid-tone — the glow
                 // should read as light going out, not as paint.
-                [[themes::current().ink colorWithAlphaComponent:0.055] setFill];
+                [[themes::current().ink colorWithAlphaComponent:_highContrast ? 0.11 : 0.055] setFill];
                 [face fill];
 
                 // Soft outer glow, then the accent fill fading to transparent.
@@ -602,9 +702,11 @@ static const char* kNames[3][7] = {
                 // Resting hint: practice targets are intentionally stronger
                 // than the normal idle preview, but still use the current
                 // theme's accent so they do not introduce a new visual style.
+                const double breathe = _reducedMotion
+                    ? 0.0 : 0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI);
                 const double b = practicePreview
-                    ? 0.20 + 0.08 * (0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI))
-                    : 0.10 + 0.06 * (0.5 + 0.5 * std::sin(_shimmer * 2 * M_PI));
+                    ? 0.20 + 0.08 * breathe
+                    : 0.10 + 0.06 * breathe;
                 [[g colorWithAlphaComponent:b] setFill];
                 [face fill];
                 [[g colorWithAlphaComponent:practicePreview ? 0.78 : 0.35] setStroke];
@@ -616,11 +718,13 @@ static const char* kNames[3][7] = {
                 // Idle: near-invisible fill, plus a per-theme edge. The stroke
                 // is blended toward the accent by edge_tint so a "plated" theme
                 // (Asmoday) shows its gold trim while others stay neutral.
-                [[themes::current().ink colorWithAlphaComponent:0.055] setFill];
+                [[themes::current().ink colorWithAlphaComponent:_highContrast ? 0.11 : 0.055] setFill];
                 [face fill];
-                NSColor* edge = [ink_faint()
-                    blendedColorWithFraction:themes::current().edge_tint
-                                     ofColor:gold()];
+                NSColor* edge = _highContrast
+                    ? [ink_soft() colorWithAlphaComponent:0.95]
+                    : [ink_faint()
+                        blendedColorWithFraction:themes::current().edge_tint
+                                         ofColor:gold()];
                 [edge setStroke];
                 face.lineWidth = themes::current().key_stroke;
                 [face stroke];
@@ -631,16 +735,39 @@ static const char* kNames[3][7] = {
             NSColor* text = lit > 0.55
                 ? on_accent()
                 : (preview ? [g colorWithAlphaComponent:practicePreview ? 0.95 : 0.75]
-                           : [ink_faint() blendedColorWithFraction:lit
-                                                           ofColor:on_accent()]);
-            NSDictionary* attrs = @{
-                NSFontAttributeName:
-                    [NSFont monospacedSystemFontOfSize:11
-                                                  weight:practicePreview
-                                                      ? NSFontWeightBold
-                                                      : NSFontWeightSemibold],
-                NSForegroundColorAttributeName: text
-            };
+                           : (_highContrast ? ink_soft()
+                                            : [ink_faint() blendedColorWithFraction:lit
+                                                                            ofColor:on_accent()]));
+            // Foundation raises an Objective-C exception if an object in a
+            // dictionary literal is nil. A color blend can legally return nil
+            // for an unsupported color-space combination, so keep rendering
+            // the key labels with a themed fallback instead of crashing the
+            // whole HUD during a display refresh.
+            NSFont* labelFont =
+                [NSFont monospacedSystemFontOfSize:11
+                                              weight:practicePreview
+                                                  ? NSFontWeightBold
+                                                  : NSFontWeightSemibold];
+            if (labelFont == nil) {
+                labelFont = [NSFont systemFontOfSize:11
+                                                weight:practicePreview
+                                                    ? NSFontWeightBold
+                                                    : NSFontWeightSemibold];
+            }
+            if (labelFont == nil) {
+                labelFont = [NSFont systemFontOfSize:11];
+            }
+
+            NSColor* labelColor = text != nil ? text : ink_soft();
+            if (labelColor == nil) {
+                labelColor = NSColor.whiteColor;
+            }
+
+            NSMutableDictionary* attrs = [NSMutableDictionary dictionaryWithCapacity:2];
+            if (labelFont != nil) {
+                attrs[NSFontAttributeName] = labelFont;
+            }
+            attrs[NSForegroundColorAttributeName] = labelColor;
             const NSString* label = [NSString stringWithUTF8String:kNames[row][col]];
             const NSSize size = [label sizeWithAttributes:attrs];
             [label drawAtPoint:NSMakePoint(NSMinX(r) + (cell - size.width) * 0.5,
@@ -735,6 +862,7 @@ static const char* kNames[3][7] = {
 @property(nonatomic, copy) NSString* title;
 @property(nonatomic, strong) NSMenu* menu_;      // items supplied by the owner
 @property(nonatomic) BOOL hovering;
+@property(nonatomic) BOOL expanded;
 @end
 
 @implementation SongPicker {
@@ -761,33 +889,70 @@ static const char* kNames[3][7] = {
 - (void)mouseEntered:(NSEvent*)e { _hovering = YES; self.needsDisplay = YES; }
 - (void)mouseExited:(NSEvent*)e { _hovering = NO; self.needsDisplay = YES; }
 
-- (void)mouseDown:(NSEvent*)event {
-    if (_menu_ != nil) {
-        [_menu_ popUpMenuPositioningItem:nil
-                             atLocation:NSMakePoint(0, NSHeight(self.bounds) + 2)
-                                 inView:self];
+- (BOOL)isAccessibilityElement { return YES; }
+- (NSString*)accessibilityRole { return NSAccessibilityPopUpButtonRole; }
+- (NSString*)accessibilityLabel { return self.title.length > 0 ? self.title : @"Song picker"; }
+- (NSString*)accessibilityValue { return self.title ?: @""; }
+- (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)openMenu {
+    if (_menu_ == nil) {
+        return;
     }
+    [self.window makeFirstResponder:self];
+    self.expanded = YES;
+    self.needsDisplay = YES;
+    [_menu_ popUpMenuPositioningItem:nil
+                         atLocation:NSMakePoint(0, NSHeight(self.bounds) + 3)
+                             inView:self];
+    self.expanded = NO;
+    self.needsDisplay = YES;
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    [self openMenu];
+}
+
+- (void)keyDown:(NSEvent*)event {
+    if (event.keyCode == 36 || event.keyCode == 49 || event.keyCode == 76) {
+        [self openMenu];
+        return;
+    }
+    [super keyDown:event];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
     const NSRect b = self.bounds;
     NSBezierPath* bg = [NSBezierPath bezierPathWithRoundedRect:b xRadius:7 yRadius:7];
-    [[themes::current().ink colorWithAlphaComponent:_hovering ? 0.12 : 0.07] setFill];
+    const BOOL active = _hovering || _expanded || self.window.firstResponder == self;
+    [[themes::current().ink colorWithAlphaComponent:active ? 0.12 : 0.07] setFill];
     [bg fill];
-    [[themes::current().ink colorWithAlphaComponent:0.10] setStroke];
+    [[(active ? gold() : themes::current().ink)
+        colorWithAlphaComponent:active ? 0.38 : 0.10] setStroke];
     bg.lineWidth = 1.0;
     [bg stroke];
+
+    // Give the chevron its own small affordance so the field reads as a
+    // picker rather than a static label.
+    const CGFloat dividerX = NSMaxX(b) - 31;
+    [[themes::current().ink colorWithAlphaComponent:active ? 0.18 : 0.10] setStroke];
+    NSBezierPath* divider = [NSBezierPath bezierPath];
+    [divider moveToPoint:NSMakePoint(dividerX, NSMinY(b) + 6)];
+    [divider lineToPoint:NSMakePoint(dividerX, NSMaxY(b) - 6)];
+    divider.lineWidth = 1.0;
+    [divider stroke];
 
     // Chevron on the trailing edge.
     const CGFloat cx = NSMaxX(b) - 14;
     const CGFloat cy = NSMidY(b);
     NSBezierPath* chev = [NSBezierPath bezierPath];
-    [chev moveToPoint:NSMakePoint(cx - 3.5, cy + 1.5)];
-    [chev lineToPoint:NSMakePoint(cx, cy - 2.0)];
-    [chev lineToPoint:NSMakePoint(cx + 3.5, cy + 1.5)];
+    const CGFloat direction = _expanded ? 1.0 : -1.0;
+    [chev moveToPoint:NSMakePoint(cx - 3.5, cy - direction * 1.5)];
+    [chev lineToPoint:NSMakePoint(cx, cy + direction * 2.0)];
+    [chev lineToPoint:NSMakePoint(cx + 3.5, cy - direction * 1.5)];
     chev.lineWidth = 1.6;
     chev.lineCapStyle = NSLineCapStyleRound;
-    [ink_soft() setStroke];
+    [(active ? gold() : ink_soft()) setStroke];
     [chev stroke];
 
     if (_title.length == 0) {
@@ -797,7 +962,7 @@ static const char* kNames[3][7] = {
         NSFontAttributeName: [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium],
         NSForegroundColorAttributeName: ink()
     };
-    const CGFloat maxw = b.size.width - 12 - 22;
+    const CGFloat maxw = b.size.width - 12 - 34;
     NSString* text = _title;
     NSSize size = [text sizeWithAttributes:attrs];
     // Truncate by trimming until it fits, then add an ellipsis.
@@ -1005,14 +1170,129 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
 @end
 
-@interface PlayerWindowController () <PanelMouseDelegate>
+// Empty-state call-to-action. It keeps native NSButton semantics (including
+// keyboard activation and accessibility) while drawing a larger, clearly
+// interactive surface that still uses only the active theme's palette.
+@interface EmptyStateButton : NSButton
+@end
+
+@implementation EmptyStateButton {
+    NSTrackingArea* _tracking;
+    BOOL _hovering;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_tracking != nil) {
+        [self removeTrackingArea:_tracking];
+    }
+    _tracking = [[NSTrackingArea alloc]
+        initWithRect:self.bounds
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self
+            userInfo:nil];
+    [self addTrackingArea:_tracking];
+}
+
+- (void)resetCursorRects {
+    [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor];
+}
+
+- (void)mouseEntered:(NSEvent*)event {
+    _hovering = YES;
+    self.needsDisplay = YES;
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    _hovering = NO;
+    self.needsDisplay = YES;
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    self.needsDisplay = YES;
+}
+
+- (BOOL)becomeFirstResponder {
+    const BOOL became = [super becomeFirstResponder];
+    self.needsDisplay = YES;
+    return became;
+}
+
+- (BOOL)resignFirstResponder {
+    const BOOL resigned = [super resignFirstResponder];
+    self.needsDisplay = YES;
+    return resigned;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    const NSRect bounds = NSInsetRect(self.bounds, 1.0, 1.0);
+    const CGFloat radius = 8.0;
+    const BOOL focused = self.window != nil && self.window.firstResponder == self;
+    const CGFloat hover = _hovering ? 1.0 : 0.0;
+    const CGFloat pressed = self.highlighted ? 1.0 : 0.0;
+
+    NSColor* accent = gold();
+    NSColor* fill = [ink() colorWithAlphaComponent:0.07 + 0.07 * hover +
+                                                   0.04 * pressed];
+    [fill setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:bounds
+                                     xRadius:radius
+                                     yRadius:radius] fill];
+
+    NSColor* border = [accent colorWithAlphaComponent:0.32 + 0.42 * hover +
+                                                        0.12 * pressed];
+    [border setStroke];
+    NSBezierPath* outline = [NSBezierPath bezierPathWithRoundedRect:bounds
+                                                              xRadius:radius
+                                                              yRadius:radius];
+    outline.lineWidth = 1.0 + hover;
+    [outline stroke];
+
+    if (focused) {
+        [[accent colorWithAlphaComponent:0.9] setStroke];
+        NSBezierPath* focus = [NSBezierPath bezierPathWithRoundedRect:
+            NSInsetRect(self.bounds, 0.5, 0.5) xRadius:radius + 1.0 yRadius:radius + 1.0];
+        focus.lineWidth = 2.0;
+        [focus stroke];
+    }
+
+    [super drawRect:dirtyRect];
+}
+
+@end
+
+@interface PlayerWindowController () <PanelMouseDelegate, NSWindowDelegate>
 - (void)loadQueueIndex:(NSInteger)index
            sourceIndex:(NSInteger)sourceIndex
               autoplay:(BOOL)autoplay;
 - (void)practiceKeyPressed:(NSNumber*)value;
 - (void)toggleTempoPractice:(id)sender;
+- (void)toggleAutoPracticeSpeed:(id)sender;
+- (void)setSpeedRamp:(NSMenuItem*)sender;
+- (void)setPracticeDifficulty:(NSMenuItem*)sender;
+- (void)toggleShowSummary:(id)sender;
+- (PracticeDashboardController*)practiceDashboard;
+- (void)toggleUpcomingNote:(id)sender;
+- (void)toggleReducedMotion:(id)sender;
+- (void)setMetronomeMode:(NSMenuItem*)sender;
+- (void)applyMetronome;
+- (void)metronomeTick:(NSTimer*)timer;
+- (void)startDrill:(id)sender;
+- (void)stopDrill:(id)sender;
+- (void)loadDrillItem;
+- (void)flashHint:(NSString*)message;
+- (void)toggleHighContrast:(id)sender;
+- (void)toggleFavoritesOnly:(id)sender;
+- (void)setCountIn:(NSMenuItem*)sender;
+- (void)setLatencyOffset:(NSMenuItem*)sender;
 - (void)restartPracticePhrase:(id)sender;
 - (void)showPracticeDashboard:(id)sender;
+- (void)moveCurrentSong:(NSMenuItem*)sender;
+- (void)removeSongFromQueue:(NSMenuItem*)sender;
+- (void)clearQueue:(id)sender;
+- (void)toggleFavoriteForSong:(NSMenuItem*)sender;
 @end
 
 @implementation PlayerWindowController {
@@ -1044,7 +1324,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSButton* _speedButton;
     MiniProgress* _miniProgress;   // thin bar shown when collapsed
     NSTimer* _uiTimer;
+    NSTimer* _focusTimer;
     PracticeDashboardController* _practiceDashboard;
+    BOOL _dashboardHiddenForBlur;  // dashboard was open when Genshin lost focus
     id _hotkeyMonitor;
     CGFloat _target_alpha;
     pid_t _genshin_pid;
@@ -1054,6 +1336,8 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSPoint _dragStartMouse;
     NSPoint _dragStartOrigin;
     BOOL _pointerInside;
+    // Bring Genshin to the front once, when we first locate its window at launch.
+    BOOL _didActivateGenshin;
     // Once the user drags the HUD, remember its position as an offset from the
     // game window's top-right corner so it still follows the game but no longer
     // snaps back to the default dock.
@@ -1061,8 +1345,28 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSSize _userOffset;
 
     BOOL _autoPauseOnBlur;         // auto-pause when Genshin loses focus
+    BOOL _playInBackground;
+    BOOL _showUpcoming;
+    BOOL _reducedMotion;
+    NSInteger _metronomeMode;      // 0 off, 1 note cues, 2 steady beat
+    NSInteger _songBpm;            // current song's BPM (0 = unknown)
+    NSTimer* _metronomeTimer;      // high-rate poll for the steady beat
+    std::size_t _lastMetronomeTick;
+    std::vector<DrillItem> _drill; // active drill queue (empty = no drill)
+    std::size_t _drillPos;
+    BOOL _drillLoading;            // suppress drill checks while switching items
+    NSString* _flashHint;          // short-lived status line override
+    NSTimeInterval _flashHintUntil;
+    BOOL _highContrast;
+    BOOL _favoritesOnly;
+    NSInteger _countInSeconds;
+    NSInteger _latencyOffsetMs;
+    NSInteger _rampStartPct;       // speed ramp start (0 = current speed)
+    NSInteger _difficulty;         // 0 easy, 1 normal, 2 strict
+    std::size_t _lastMetronomeBeat;
     BOOL _wasFocused;              // edge-detect focus loss
     BOOL _openPanelActive;         // keep HUD up while the file picker is open
+    NSInteger _menuTrackingDepth;  // AppKit menus temporarily take focus/input
     NSView* _tintView;            // panel background tint (re-colored on theme change)
     NSButton* _hideButton;        // × close button (kept for localization)
     NSButton* _settingsButton;    // gear — opens the same menu as right-click
@@ -1095,6 +1399,22 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _collapsed = settings::get_bool(kSettingCollapsed, false);
     // Auto-pause defaults ON (first launch has no stored value).
     _autoPauseOnBlur = settings::get_bool(kSettingAutoPause, true);
+    _playInBackground = settings::get_bool(kSettingPlayInBackground, true);
+    _keyboard->set_play_in_background(_playInBackground);
+    _showUpcoming = settings::get_bool(kSettingShowUpcoming, true);
+    _reducedMotion = settings::get_bool(kSettingReducedMotion, false);
+    _metronomeMode = std::clamp(settings::get_int(kSettingMetronomeMode,
+        settings::get_bool(kSettingMetronome, false) ? 1 : 0), 0, 2);
+    _songBpm = bpm;
+    _lastMetronomeTick = 0;
+    _drillPos = 0;
+    _drillLoading = NO;
+    _flashHintUntil = 0.0;
+    _highContrast = settings::get_bool(kSettingHighContrast, false);
+    _favoritesOnly = settings::get_bool(kSettingFavoritesOnly, false);
+    _countInSeconds = std::clamp(settings::get_int(kSettingCountIn, 3), 0, 5);
+    _latencyOffsetMs = std::clamp(settings::get_int(kSettingLatencyOffset, 0), -300, 300);
+    _lastMetronomeBeat = 0;
     _wasFocused = NO;
 
     // Restore theme + language before building the UI so colors and strings are
@@ -1103,9 +1423,18 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     strings::set_current(settings::get_string(kSettingLang, "en") == "zh"
         ? Lang::chinese : Lang::english);
 
-    _playback->set_countdown(std::chrono::milliseconds(3000));
+    _playback->set_countdown(std::chrono::seconds(_countInSeconds));
     _playback->set_practice_mode(settings::get_bool(kSettingLearn, false));
     _playback->set_practice_tempo(settings::get_bool(kSettingTempoPractice, false));
+    _playback->set_practice_auto_speed(settings::get_bool(kSettingAutoSpeed, false));
+    _playback->set_practice_lock_until_mastered(
+        settings::get_bool(kSettingLockMastered, false));
+    _rampStartPct = std::clamp(settings::get_int(kSettingRampStart, 0), 0, 100);
+    _playback->set_practice_ramp_start(_rampStartPct / 100.0);
+    _playback->set_metronome_bpm(_metronomeMode == 2 ? static_cast<int>(_songBpm) : 0);
+    _difficulty = std::clamp(settings::get_int(kSettingDifficulty, 1), 0, 2);
+    _playback->set_practice_timing_windows(timing_windows_for_difficulty(_difficulty));
+    _playback->set_practice_latency_offset(std::chrono::milliseconds(_latencyOffsetMs));
 
     // Auto-advance to the next queued song when one finishes naturally.
     __weak PlayerWindowController* weak = self;
@@ -1119,6 +1448,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     window.backgroundColor = NSColor.clearColor;
     window.hasShadow = YES;
     window.level = NSScreenSaverWindowLevel;
+    window.delegate = self;
     window.floatingPanel = YES;
     window.becomesKeyOnlyIfNeeded = YES;
     window.hidesOnDeactivate = NO;
@@ -1203,14 +1533,20 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
     // Library row: a big "Open songs…" when empty; the playlist picker once
     // loaded (adding more happens via the header +).
-    _openButton = [NSButton buttonWithTitle:strings::get(Str::open_songs)
-                                     target:self
-                                     action:@selector(openSongs:)];
+    _openButton = [EmptyStateButton buttonWithTitle:strings::get(Str::open_songs)
+                                              target:self
+                                              action:@selector(openSongs:)];
+    _openButton.buttonType = NSButtonTypeMomentaryPushIn;
     _openButton.bezelStyle = NSBezelStyleInline;
     _openButton.bordered = NO;
+    _openButton.refusesFirstResponder = NO;
+    _openButton.focusRingType = NSFocusRingTypeExterior;
+    _openButton.alignment = NSTextAlignmentCenter;
+    _openButton.imagePosition = NSImageLeft;
+    _openButton.imageHugsTitle = YES;
     _openButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     _openButton.contentTintColor = gold();
-    _openButton.toolTip = strings::get(Str::tip_add);
+    [_openButton.heightAnchor constraintEqualToConstant:44].active = YES;
     [self styleOpenButton];
 
     _songPicker = [[SongPicker alloc] initWithFrame:NSZeroRect];
@@ -1228,6 +1564,8 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _key_grid = [[LyreKeyGridView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 96)];
     _key_grid.keyboard = keyboard;
     _key_grid.practiceMode = _playback->practice_mode();
+    _key_grid.reducedMotion = _reducedMotion;
+    _key_grid.highContrast = _highContrast;
     _key_grid.practiceTarget = self;
     _key_grid.practiceAction = @selector(practiceKeyPressed:);
     _key_grid.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1377,6 +1715,39 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _uiTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0
                                                 target:self selector:@selector(refresh)
                                               userInfo:nil repeats:YES];
+    // Focus and placement must continue to reconcile while AppKit is tracking
+    // a menu or running an NSOpenPanel. A default-mode timer pauses in those
+    // run-loop modes, leaving the HUD in whichever visibility state it had
+    // before the interaction began.
+    _focusTimer = [NSTimer timerWithTimeInterval:0.1
+                                           target:self
+                                         selector:@selector(updateFocusAppearance)
+                                         userInfo:nil
+                                          repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:_focusTimer forMode:NSRunLoopCommonModes];
+
+    NSNotificationCenter* notifications = NSNotificationCenter.defaultCenter;
+    [notifications addObserver:self
+                       selector:@selector(menuDidBeginTracking:)
+                           name:NSMenuDidBeginTrackingNotification
+                         object:nil];
+    [notifications addObserver:self
+                       selector:@selector(menuDidEndTracking:)
+                           name:NSMenuDidEndTrackingNotification
+                         object:nil];
+
+    // React the instant the frontmost app changes instead of waiting for the
+    // next focus-timer tick; the timer stays as a backstop.
+    NSNotificationCenter* workspace = NSWorkspace.sharedWorkspace.notificationCenter;
+    for (NSNotificationName name in @[NSWorkspaceDidActivateApplicationNotification,
+                                      NSWorkspaceDidDeactivateApplicationNotification,
+                                      NSWorkspaceDidHideApplicationNotification,
+                                      NSWorkspaceDidUnhideApplicationNotification]) {
+        [workspace addObserver:self
+                      selector:@selector(workspaceFocusChanged:)
+                          name:name
+                        object:nil];
+    }
 
     // Global hotkeys work while Genshin has focus. ⌘⌥Space play/pause,
     // ⌘⌥. stop, ⌘⌥L loop, ⌘⌥H show/raise the HUD.
@@ -1393,11 +1764,15 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     if (_hotkeyMonitor != nil) {
         [NSEvent removeMonitor:_hotkeyMonitor];
     }
     _playback->set_on_finished(nullptr);
     [_uiTimer invalidate];
+    [_focusTimer invalidate];
+    [_metronomeTimer invalidate];
 }
 
 #pragma mark - Small builders
@@ -1442,7 +1817,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         [self openSongs:nil];
         return;
     }
-    _genshin->activate_application();
+    if (!_playInBackground) {
+        _genshin->activate_application();
+    }
     _playback->play();
     [self refresh];
 }
@@ -1478,13 +1855,19 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
-- (void)showPracticeDashboard:(id)sender {
+// Created on first use (the HUD's first refresh) and kept alive, so practice
+// history and session summaries are recorded even if Insights is never opened.
+- (PracticeDashboardController*)practiceDashboard {
     if (_practiceDashboard == nil) {
         _practiceDashboard = [[PracticeDashboardController alloc]
             initWithPlayback:_playback];
         [_practiceDashboard.window center];
     }
-    [_practiceDashboard setSongKey:_titleLabel.stringValue];
+    return _practiceDashboard;
+}
+
+- (void)showPracticeDashboard:(id)sender {
+    [[self practiceDashboard] setSongKey:_titleLabel.stringValue];
     [_practiceDashboard refresh];
     [_practiceDashboard showWindow:self];
     [_practiceDashboard.window orderFrontRegardless];
@@ -1543,10 +1926,21 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     settings::set_bool(kSettingAutoPause, _autoPauseOnBlur);
 }
 
+- (void)togglePlayInBackground:(id)sender {
+    _playInBackground = !_playInBackground;
+    settings::set_bool(kSettingPlayInBackground, _playInBackground);
+    _keyboard->set_play_in_background(_playInBackground);
+    if (!_playInBackground) {
+        _genshin->activate_application();
+    }
+    [self refresh];
+}
+
 - (void)toggleLearnMode:(id)sender {
     const BOOL enabled = !_playback->practice_mode();
     _playback->set_practice_mode(enabled);
     settings::set_bool(kSettingLearn, enabled);
+    [self reloadQueueMetadata];
     [self refresh];
 }
 
@@ -1561,15 +1955,163 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
+- (void)toggleAutoPracticeSpeed:(id)sender {
+    const BOOL enabled = !_playback->practice_auto_speed();
+    if (!_playback->practice_mode()) {
+        _playback->set_practice_mode(true);
+        settings::set_bool(kSettingLearn, true);
+    }
+    if (!_playback->practice_tempo()) {
+        _playback->set_practice_tempo(true);
+        settings::set_bool(kSettingTempoPractice, true);
+    }
+    _playback->set_practice_auto_speed(enabled);
+    settings::set_bool(kSettingAutoSpeed, enabled);
+    [self refresh];
+}
+
+- (void)setSpeedRamp:(NSMenuItem*)sender {
+    const NSInteger pct = [(NSNumber*)sender.representedObject integerValue];
+    const BOOL enabled = pct >= 0;
+    if (enabled) {
+        if (!_playback->practice_mode()) {
+            _playback->set_practice_mode(true);
+            settings::set_bool(kSettingLearn, true);
+        }
+        if (!_playback->practice_tempo()) {
+            _playback->set_practice_tempo(true);
+            settings::set_bool(kSettingTempoPractice, true);
+        }
+        _rampStartPct = pct;
+        settings::set_int(kSettingRampStart, static_cast<int>(pct));
+        _playback->set_practice_ramp_start(pct / 100.0);
+    }
+    _playback->set_practice_auto_speed(enabled);
+    settings::set_bool(kSettingAutoSpeed, enabled);
+    [self refresh];
+}
+
+- (void)setPracticeDifficulty:(NSMenuItem*)sender {
+    _difficulty = std::clamp([(NSNumber*)sender.representedObject integerValue], 0L, 2L);
+    settings::set_int(kSettingDifficulty, static_cast<int>(_difficulty));
+    _playback->set_practice_timing_windows(timing_windows_for_difficulty(_difficulty));
+    [self refresh];
+}
+
+- (void)toggleShowSummary:(id)sender {
+    settings::set_bool(kSettingShowSummary, !settings::get_bool(kSettingShowSummary, true));
+}
+
+- (void)toggleLockUntilMastered:(id)sender {
+    const BOOL enabled = !_playback->practice_lock_until_mastered();
+    if (!_playback->practice_mode()) {
+        _playback->set_practice_mode(true);
+        settings::set_bool(kSettingLearn, true);
+    }
+    _playback->set_practice_lock_until_mastered(enabled);
+    settings::set_bool(kSettingLockMastered, enabled);
+    [self refresh];
+}
+
+- (void)toggleUpcomingNote:(id)sender {
+    _showUpcoming = !_showUpcoming;
+    settings::set_bool(kSettingShowUpcoming, _showUpcoming);
+    [self refresh];
+}
+
+- (void)toggleReducedMotion:(id)sender {
+    _reducedMotion = !_reducedMotion;
+    settings::set_bool(kSettingReducedMotion, _reducedMotion);
+    _key_grid.reducedMotion = _reducedMotion;
+    [self refresh];
+}
+
+- (void)setMetronomeMode:(NSMenuItem*)sender {
+    _metronomeMode = std::clamp([(NSNumber*)sender.representedObject integerValue], 0L, 2L);
+    // Ignore already-emitted beats so switching modes never plays a stray click.
+    _lastMetronomeBeat = _playback->snapshot().practice_beat_sequence;
+    _lastMetronomeTick = _playback->practice_metronome().first;
+    settings::set_int(kSettingMetronomeMode, static_cast<int>(_metronomeMode));
+    _playback->set_metronome_bpm(_metronomeMode == 2 ? static_cast<int>(_songBpm) : 0);
+    [self refresh];
+}
+
+// The steady beat needs tighter timing than the 30 fps UI refresh, so a fast
+// timer runs only while a timed practice run is active with the beat on.
+- (void)applyMetronome {
+    const PlaybackState state = _playback->snapshot().state;
+    const BOOL want = _metronomeMode == 2 && _songBpm > 0 &&
+        _playback->practice_mode() && _playback->practice_tempo() &&
+        (state == PlaybackState::playing || state == PlaybackState::countdown);
+    if (want && _metronomeTimer == nil) {
+        _lastMetronomeTick = _playback->practice_metronome().first;
+        _metronomeTimer = [NSTimer timerWithTimeInterval:0.004
+                                                  target:self
+                                                selector:@selector(metronomeTick:)
+                                                userInfo:nil
+                                                 repeats:YES];
+        _metronomeTimer.tolerance = 0.001;
+        [[NSRunLoop mainRunLoop] addTimer:_metronomeTimer forMode:NSRunLoopCommonModes];
+    } else if (!want && _metronomeTimer != nil) {
+        [_metronomeTimer invalidate];
+        _metronomeTimer = nil;
+    }
+}
+
+- (void)metronomeTick:(NSTimer*)timer {
+    _playback->practice_tick();
+    const auto [ticks, downbeat] = _playback->practice_metronome();
+    if (ticks == _lastMetronomeTick) {
+        return;
+    }
+    _lastMetronomeTick = ticks;
+    static NSSound* beat = [NSSound soundNamed:@"Tink"];
+    static NSSound* accent = [NSSound soundNamed:@"Pop"];
+    NSSound* sound = downbeat ? accent : beat;
+    [sound stop];
+    [sound play];
+}
+
+- (void)toggleHighContrast:(id)sender {
+    _highContrast = !_highContrast;
+    settings::set_bool(kSettingHighContrast, _highContrast);
+    _key_grid.highContrast = _highContrast;
+    [self refresh];
+}
+
+- (void)toggleFavoritesOnly:(id)sender {
+    _favoritesOnly = !_favoritesOnly;
+    settings::set_bool(kSettingFavoritesOnly, _favoritesOnly);
+    [self reloadQueuePicker];
+}
+
+- (void)setCountIn:(NSMenuItem*)sender {
+    const NSInteger seconds = std::clamp(
+        [(NSNumber*)sender.representedObject integerValue], 0L, 5L);
+    _countInSeconds = seconds;
+    _playback->set_countdown(std::chrono::seconds(seconds));
+    settings::set_int(kSettingCountIn, static_cast<int>(seconds));
+    [self refresh];
+}
+
+- (void)setLatencyOffset:(NSMenuItem*)sender {
+    const NSInteger offset = std::clamp(
+        [(NSNumber*)sender.representedObject integerValue], -300L, 300L);
+    _latencyOffsetMs = offset;
+    _playback->set_practice_latency_offset(std::chrono::milliseconds(offset));
+    settings::set_int(kSettingLatencyOffset, static_cast<int>(offset));
+    [self refresh];
+}
+
 - (NSMenu*)panelContextMenu {
     NSMenu* menu = [[NSMenu alloc] init];
 
-    NSMenuItem* ap = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_autopause)
-                                                action:@selector(toggleAutoPause:)
-                                         keyEquivalent:@""];
-    ap.target = self;
-    ap.state = _autoPauseOnBlur ? NSControlStateValueOn : NSControlStateValueOff;
-    [menu addItem:ap];
+    // Keep the menu scannable by grouping related controls. These are still
+    // ordinary NSMenuItems, so keyboard navigation and state checkmarks work
+    // exactly as before while the HUD remains compact.
+    NSMenuItem* practiceItem = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_practice) action:nil keyEquivalent:@""];
+    NSMenu* practiceMenu = [[NSMenu alloc] initWithTitle:practiceItem.title];
 
     NSMenuItem* learn = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_learn)
                                                    action:@selector(toggleLearnMode:)
@@ -1577,7 +2119,15 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     learn.target = self;
     learn.state = _playback->practice_mode()
         ? NSControlStateValueOn : NSControlStateValueOff;
-    [menu addItem:learn];
+    [practiceMenu addItem:learn];
+
+    if (_playback->practice_mode()) {
+        NSMenuItem* safety = [[NSMenuItem alloc]
+            initWithTitle:strings::get(Str::menu_safety)
+                   action:nil keyEquivalent:@""];
+        safety.enabled = NO;
+        [practiceMenu addItem:safety];
+    }
 
     NSMenuItem* tempo = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_tempo_practice)
@@ -1587,7 +2137,134 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     tempo.state = _playback->practice_tempo()
         ? NSControlStateValueOn : NSControlStateValueOff;
     tempo.enabled = _playback->practice_mode();
-    [menu addItem:tempo];
+    [practiceMenu addItem:tempo];
+
+    NSMenuItem* metronome = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_metronome) action:nil keyEquivalent:@""];
+    NSMenu* metronomeMenu = [[NSMenu alloc] init];
+    for (NSInteger mode = 0; mode <= 2; ++mode) {
+        NSString* title = mode == 0 ? strings::get(Str::option_off)
+            : mode == 1 ? strings::get(Str::metronome_note_cues)
+            : (_songBpm > 0
+                ? [NSString stringWithFormat:strings::get(Str::metronome_steady_bpm), (long)_songBpm]
+                : strings::get(Str::metronome_steady));
+        NSMenuItem* item = [[NSMenuItem alloc]
+            initWithTitle:title action:@selector(setMetronomeMode:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @(mode);
+        item.state = mode == _metronomeMode ? NSControlStateValueOn : NSControlStateValueOff;
+        item.enabled = mode != 2 || _songBpm > 0;
+        [metronomeMenu addItem:item];
+    }
+    metronome.submenu = metronomeMenu;
+    metronome.enabled = _playback->practice_mode() && _playback->practice_tempo();
+    [practiceMenu addItem:metronome];
+
+    // Speed ramp: Off, climb from the current speed, or restart each run slow.
+    NSMenuItem* autoSpeed = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_auto_speed) action:nil keyEquivalent:@""];
+    NSMenu* rampMenu = [[NSMenu alloc] init];
+    const BOOL rampOn = _playback->practice_auto_speed();
+    for (NSNumber* value in @[@(-1), @(0), @(50), @(60), @(75)]) {
+        const NSInteger pct = value.integerValue;
+        NSString* title = pct < 0 ? strings::get(Str::option_off)
+            : pct == 0 ? strings::get(Str::ramp_from_current)
+            : [NSString stringWithFormat:strings::get(Str::ramp_from_percent), (long)pct];
+        NSMenuItem* item = [[NSMenuItem alloc]
+            initWithTitle:title action:@selector(setSpeedRamp:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = value;
+        const BOOL selected = pct < 0 ? !rampOn : (rampOn && pct == _rampStartPct);
+        item.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+        [rampMenu addItem:item];
+    }
+    autoSpeed.submenu = rampMenu;
+    autoSpeed.enabled = _playback->practice_mode();
+    [practiceMenu addItem:autoSpeed];
+
+    NSMenuItem* difficulty = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_difficulty) action:nil keyEquivalent:@""];
+    NSMenu* difficultyMenu = [[NSMenu alloc] init];
+    const Str difficultyNames[3] = {Str::difficulty_easy, Str::difficulty_normal,
+                                    Str::difficulty_strict};
+    for (NSInteger level = 0; level < 3; ++level) {
+        NSMenuItem* item = [[NSMenuItem alloc]
+            initWithTitle:strings::get(difficultyNames[level])
+                   action:@selector(setPracticeDifficulty:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @(level);
+        item.state = level == _difficulty ? NSControlStateValueOn : NSControlStateValueOff;
+        [difficultyMenu addItem:item];
+    }
+    difficulty.submenu = difficultyMenu;
+    difficulty.enabled = _playback->practice_mode() && _playback->practice_tempo();
+    [practiceMenu addItem:difficulty];
+
+    NSMenuItem* lockMastered = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_lock_mastered)
+               action:@selector(toggleLockUntilMastered:)
+        keyEquivalent:@""];
+    lockMastered.target = self;
+    lockMastered.state = _playback->practice_lock_until_mastered()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    lockMastered.enabled = _playback->practice_mode();
+    [practiceMenu addItem:lockMastered];
+
+    NSMenuItem* upcoming = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_show_upcoming)
+               action:@selector(toggleUpcomingNote:)
+        keyEquivalent:@""];
+    upcoming.target = self;
+    upcoming.state = _showUpcoming ? NSControlStateValueOn : NSControlStateValueOff;
+    upcoming.enabled = _playback->practice_mode();
+    [practiceMenu addItem:upcoming];
+
+    NSMenuItem* countIn = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_count_in) action:nil keyEquivalent:@""];
+    NSMenu* countInMenu = [[NSMenu alloc] init];
+    for (NSInteger seconds = 0; seconds <= 5; ++seconds) {
+        NSString* title = seconds == 0
+            ? strings::get(Str::option_off)
+            : [NSString stringWithFormat:strings::get(Str::seconds_format), (long)seconds];
+        NSMenuItem* item = [[NSMenuItem alloc]
+            initWithTitle:title action:@selector(setCountIn:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @(seconds);
+        item.state = seconds == _countInSeconds
+            ? NSControlStateValueOn : NSControlStateValueOff;
+        [countInMenu addItem:item];
+    }
+    countIn.submenu = countInMenu;
+    [practiceMenu addItem:countIn];
+
+    NSMenuItem* offset = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_latency_offset)
+               action:nil keyEquivalent:@""];
+    NSMenu* offsetMenu = [[NSMenu alloc] init];
+    for (NSNumber* value in @[@(-150), @(-75), @(0), @(75), @(150)]) {
+        const NSInteger ms = value.integerValue;
+        NSString* title = ms == 0
+            ? @"0 ms"
+            : [NSString stringWithFormat:@"%@%ld ms", ms > 0 ? @"+" : @"", (long)ms];
+        NSMenuItem* item = [[NSMenuItem alloc]
+            initWithTitle:title action:@selector(setLatencyOffset:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = value;
+        item.state = ms == _latencyOffsetMs
+            ? NSControlStateValueOn : NSControlStateValueOff;
+        [offsetMenu addItem:item];
+    }
+    offset.submenu = offsetMenu;
+    offset.enabled = _playback->practice_mode();
+    [practiceMenu addItem:offset];
+
+    NSMenuItem* drill = [[NSMenuItem alloc]
+        initWithTitle:strings::get(_drill.empty() ? Str::menu_drill : Str::menu_stop_drill)
+               action:_drill.empty() ? @selector(startDrill:) : @selector(stopDrill:)
+        keyEquivalent:@""];
+    drill.target = self;
+    drill.enabled = self.queueDelegate != nil && [self.queueDelegate queueCount] > 0;
+    [practiceMenu addItem:drill];
 
     NSMenuItem* restartPhrase = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_restart_phrase)
@@ -1595,7 +2272,17 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         keyEquivalent:@""];
     restartPhrase.target = self;
     restartPhrase.enabled = _playback->practice_mode();
-    [menu addItem:restartPhrase];
+    [practiceMenu addItem:restartPhrase];
+
+    NSMenuItem* summary = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_show_summary)
+               action:@selector(toggleShowSummary:)
+        keyEquivalent:@""];
+    summary.target = self;
+    summary.state = settings::get_bool(kSettingShowSummary, true)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    summary.enabled = _playback->practice_mode();
+    [practiceMenu addItem:summary];
 
     NSMenuItem* insights = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_practice_insights)
@@ -1603,13 +2290,56 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         keyEquivalent:@""];
     insights.target = self;
     insights.enabled = _playback->practice_mode();
-    [menu addItem:insights];
+    [practiceMenu addItem:insights];
 
+    practiceItem.submenu = practiceMenu;
+    [menu addItem:practiceItem];
+
+    NSMenuItem* playbackItem = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_playback) action:nil keyEquivalent:@""];
+    NSMenu* playbackMenu = [[NSMenu alloc] initWithTitle:playbackItem.title];
     NSMenuItem* reset = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_reset_speed)
                                                    action:@selector(resetSpeed:)
                                             keyEquivalent:@""];
+    NSMenuItem* background = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_play_background)
+               action:@selector(togglePlayInBackground:) keyEquivalent:@""];
+    background.target = self;
+    background.state = _playInBackground
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [playbackMenu addItem:background];
+
+    NSMenuItem* ap = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_autopause)
+                                                action:@selector(toggleAutoPause:)
+                                         keyEquivalent:@""];
+    ap.target = self;
+    ap.state = _autoPauseOnBlur ? NSControlStateValueOn : NSControlStateValueOff;
+    [playbackMenu addItem:ap];
+
     reset.target = self;
-    [menu addItem:reset];
+    [playbackMenu addItem:reset];
+    playbackItem.submenu = playbackMenu;
+    [menu addItem:playbackItem];
+
+    NSMenuItem* accessibilityItem = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_accessibility) action:nil keyEquivalent:@""];
+    NSMenu* accessibilityMenu =
+        [[NSMenu alloc] initWithTitle:accessibilityItem.title];
+    NSMenuItem* motion = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_reduced_motion)
+               action:@selector(toggleReducedMotion:) keyEquivalent:@""];
+    motion.target = self;
+    motion.state = _reducedMotion ? NSControlStateValueOn : NSControlStateValueOff;
+    [accessibilityMenu addItem:motion];
+    NSMenuItem* highContrast = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_high_contrast)
+               action:@selector(toggleHighContrast:) keyEquivalent:@""];
+    highContrast.target = self;
+    highContrast.state = _highContrast
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [accessibilityMenu addItem:highContrast];
+    accessibilityItem.submenu = accessibilityMenu;
+    [menu addItem:accessibilityItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
 
@@ -1661,10 +2391,19 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 // Gear button — pops the same menu the right-click gesture shows, anchored
 // just under the button.
 - (void)showSettingsMenu:(id)sender {
+    // A grid click posts key-down immediately and normally releases it on the
+    // matching mouse-up. Opening a menu can move that mouse-up into AppKit's
+    // menu tracking loop, so release defensively before changing focus.
+    [_key_grid releaseHeldKey];
     NSButton* button = _settingsButton;
     NSMenu* menu = [self panelContextMenu];
     const NSPoint origin = NSMakePoint(0, NSHeight(button.bounds) + 4);
     [menu popUpMenuPositioningItem:nil atLocation:origin inView:button];
+    // Return keyboard note input to the grid after the menu is dismissed, but
+    // do not steal focus from another window opened by a menu action.
+    if (self.window.isKeyWindow) {
+        [self.window makeFirstResponder:_key_grid];
+    }
 }
 
 - (void)selectTheme:(NSMenuItem*)sender {
@@ -1687,8 +2426,8 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self applyLocalization];
 }
 
-// The "Open songs…" label is drawn by AppKit in a system color, which is
-// unreadable on a light theme — give it an explicit themed attributed title.
+// Keep the empty-state CTA's title, icon, tooltip, and accessibility metadata
+// together so theme and language changes update the complete control.
 - (void)styleOpenButton {
     NSMutableParagraphStyle* p = [[NSMutableParagraphStyle alloc] init];
     p.alignment = NSTextAlignmentCenter;
@@ -1699,6 +2438,16 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
                 NSForegroundColorAttributeName: gold(),
                 NSParagraphStyleAttributeName: p,
             }];
+    NSString* preferredIcon =
+        symbol(@"folder.badge.plus", 16, NSFontWeightMedium) != nil
+            ? @"folder.badge.plus" : @"folder";
+    _openButton.image = tinted_symbol(preferredIcon, 16, NSFontWeightMedium, gold());
+    _openButton.imagePosition = NSImageLeft;
+    _openButton.imageHugsTitle = YES;
+    _openButton.toolTip = strings::get(Str::open_button_help);
+    _openButton.accessibilityRole = NSAccessibilityButtonRole;
+    _openButton.accessibilityLabel = strings::get(Str::open_songs_accessibility);
+    _openButton.accessibilityHelp = strings::get(Str::open_button_help);
 }
 
 // Re-color everything that caches a theme color, then force a redraw.
@@ -1732,7 +2481,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _collapseButton.toolTip = strings::get(Str::tip_collapse);
     _hideButton.toolTip = strings::get(Str::tip_close);
     [self styleOpenButton];
-    _openButton.toolTip = strings::get(Str::tip_add);
+    _openButton.toolTip = strings::get(Str::open_button_help);
     _songPicker.toolTip = strings::get(Str::tip_playlist);
     _prevButton.toolTip = strings::get(Str::tip_previous);
     _loopButton.toolTip = strings::get(Str::tip_loop);
@@ -1822,8 +2571,100 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
     // Build the playlist menu; the current song is checked.
     NSMenu* menu = [[NSMenu alloc] init];
+    const NSInteger currentIndex = [q queueCurrentIndex];
+    NSMenuItem* favoritesOnly = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_favorites_only)
+               action:@selector(toggleFavoritesOnly:) keyEquivalent:@""];
+    favoritesOnly.target = self;
+    favoritesOnly.state = _favoritesOnly
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:favoritesOnly];
+
+    if (currentIndex >= 0 && currentIndex < count) {
+        const BOOL favorite = [q queueIsFavoriteAtIndex:currentIndex];
+        NSMenuItem* favoriteItem = [[NSMenuItem alloc]
+            initWithTitle:favorite
+                ? strings::get(Str::menu_queue_unfavorite)
+                : strings::get(Str::menu_queue_favorite)
+                   action:@selector(toggleFavoriteForSong:)
+            keyEquivalent:@""];
+        favoriteItem.target = self;
+        favoriteItem.representedObject = @{@"songIndex": @(currentIndex)};
+        [menu addItem:favoriteItem];
+    }
+
+    NSArray<NSNumber*>* recentIndexes = [q queueRecentIndexes];
+    NSMutableArray<NSNumber*>* visibleRecentIndexes = [NSMutableArray array];
+    for (NSNumber* number in recentIndexes) {
+        const NSInteger recentIndex = number.integerValue;
+        if (!_favoritesOnly || [q queueIsFavoriteAtIndex:recentIndex]) {
+            [visibleRecentIndexes addObject:number];
+        }
+    }
+    if (visibleRecentIndexes.count > 0) {
+        NSMenuItem* recent = [[NSMenuItem alloc]
+            initWithTitle:strings::get(Str::menu_recent)
+                   action:nil keyEquivalent:@""];
+        NSMenu* recentMenu = [[NSMenu alloc] initWithTitle:recent.title];
+        for (NSNumber* number in visibleRecentIndexes) {
+            const NSInteger recentIndex = number.integerValue;
+            NSString* title = [q queueTitleAtIndex:recentIndex] ?: @"";
+            NSMenuItem* recentItem = [[NSMenuItem alloc]
+                initWithTitle:title action:@selector(songMenuPicked:)
+                 keyEquivalent:@""];
+            recentItem.target = self;
+            recentItem.representedObject = @{
+                @"songIndex": @(recentIndex),
+                @"sourceIndex": @(-1),
+            };
+            [recentMenu addItem:recentItem];
+        }
+        recent.submenu = recentMenu;
+        [menu addItem:recent];
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem* moveUp = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_queue_move_up)
+               action:@selector(moveCurrentSong:) keyEquivalent:@""];
+    moveUp.target = self;
+    moveUp.tag = -1;
+    moveUp.enabled = currentIndex > 0;
+    [menu addItem:moveUp];
+
+    NSMenuItem* moveDown = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_queue_move_down)
+               action:@selector(moveCurrentSong:) keyEquivalent:@""];
+    moveDown.target = self;
+    moveDown.tag = 1;
+    moveDown.enabled = currentIndex >= 0 && currentIndex + 1 < count;
+    [menu addItem:moveDown];
+
+    NSMenuItem* remove = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_queue_remove)
+               action:@selector(removeSongFromQueue:) keyEquivalent:@""];
+    remove.target = self;
+    remove.representedObject = @{@"songIndex": @(currentIndex)};
+    remove.enabled = currentIndex >= 0;
+    [menu addItem:remove];
+
+    NSMenuItem* clear = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_queue_clear)
+               action:@selector(clearQueue:) keyEquivalent:@""];
+    clear.target = self;
+    [menu addItem:clear];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSInteger visibleSongs = 0;
     for (NSInteger i = 0; i < count; ++i) {
+        if (_favoritesOnly && ![q queueIsFavoriteAtIndex:i]) {
+            continue;
+        }
+        ++visibleSongs;
         NSString* t = [q queueTitleAtIndex:i] ?: @"";
+        if ([q queueIsFavoriteAtIndex:i]) {
+            t = [NSString stringWithFormat:@"★ %@", t];
+        }
         NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:t
                                                       action:@selector(songMenuPicked:)
                                                keyEquivalent:@""];
@@ -1854,6 +2695,14 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         }
         [menu addItem:item];
     }
+    if (visibleSongs == 0) {
+        NSString* title = _favoritesOnly
+            ? strings::get(Str::menu_no_favorites) : strings::get(Str::no_song_selected);
+        NSMenuItem* empty = [[NSMenuItem alloc] initWithTitle:title
+                                                        action:nil keyEquivalent:@""];
+        empty.enabled = NO;
+        [menu addItem:empty];
+    }
     _songPicker.menu_ = menu;
     _songPicker.title = (idx < count) ? ([q queueTitleAtIndex:idx] ?: @"") : @"";
     _songPicker.needsDisplay = YES;
@@ -1867,6 +2716,67 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     const NSInteger songIndex = [selection[@"songIndex"] integerValue];
     const NSInteger sourceIndex = [selection[@"sourceIndex"] integerValue];
     [self loadQueueIndex:songIndex sourceIndex:sourceIndex autoplay:NO];
+}
+
+- (void)moveCurrentSong:(NSMenuItem*)sender {
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    if (q != nil && [q queueMoveCurrentBy:sender.tag]) {
+        [self reloadQueuePicker];
+        [self reloadQueueMetadata];
+        [self refresh];
+    }
+}
+
+- (void)toggleFavoriteForSong:(NSMenuItem*)sender {
+    NSDictionary* selection = sender.representedObject;
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    if (q == nil || selection == nil) {
+        return;
+    }
+    [q queueToggleFavoriteAtIndex:[selection[@"songIndex"] integerValue]];
+    [self reloadQueuePicker];
+}
+
+- (void)removeSongFromQueue:(NSMenuItem*)sender {
+    NSDictionary* selection = sender.representedObject;
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    if (q == nil || selection == nil) {
+        return;
+    }
+    const NSInteger index = [selection[@"songIndex"] integerValue];
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = [NSString stringWithFormat:@"Remove “%@” from the queue?",
+        [q queueTitleAtIndex:index] ?: @""];
+    alert.informativeText = @"The file will not be deleted.";
+    [alert addButtonWithTitle:@"Remove"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+    if ([q queueRemoveIndex:index]) {
+        [self reloadQueuePicker];
+        [self reloadQueueMetadata];
+        [self refresh];
+    }
+}
+
+- (void)clearQueue:(id)sender {
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    if (q == nil || [q queueCount] == 0) {
+        return;
+    }
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = @"Clear the playlist?";
+    alert.informativeText = @"The files will not be deleted.";
+    [alert addButtonWithTitle:@"Clear"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+    [q queueClear];
+    [self reloadQueuePicker];
+    [self reloadQueueMetadata];
+    [self refresh];
 }
 
 - (void)reloadQueueMetadata {
@@ -1885,10 +2795,15 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSString* title = idx >= 0 ? ([q queueTitleAtIndex:idx] ?: @"Untitled")
                                : strings::get(Str::no_song_selected);
     const NSInteger bpm = idx >= 0 ? [q queueBpmAtIndex:idx] : 0;
+    _songBpm = bpm;
+    _playback->set_metronome_bpm(_metronomeMode == 2 ? static_cast<int>(bpm) : 0);
     _titleLabel.stringValue = title;
     _titleLabel.toolTip = title;
-    NSString* meta = bpm > 0 ? [NSString stringWithFormat:@"%ld BPM", (long)bpm]
-                             : strings::get(Str::lyre);
+    NSString* mode = _playback->practice_mode()
+        ? strings::get(Str::mode_practice) : strings::get(Str::mode_automatic);
+    NSString* meta = bpm > 0
+        ? [NSString stringWithFormat:@"%@ · %ld BPM", mode, (long)bpm]
+        : [NSString stringWithFormat:@"%@ · %@", mode, strings::get(Str::lyre)];
     if (count > 1 && idx >= 0) {
         meta = [NSString stringWithFormat:@"%@   %ld/%ld", meta,
                 (long)(idx + 1), (long)count];
@@ -1957,6 +2872,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)openSongs:(id)sender {
+    if (_openPanelActive) {
+        return;
+    }
     // Bring this app forward so the file picker takes keyboard focus and comes
     // to the front (the HUD normally runs as a non-activating accessory).
     [NSApp activateIgnoringOtherApps:YES];
@@ -1987,6 +2905,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [panel beginWithCompletionHandler:^(NSInteger result) {
         _openPanelActive = NO;
         if (result != NSModalResponseOK) {
+            [self.window makeFirstResponder:_openButton];
             return;
         }
         NSMutableArray<NSString*>* paths = [NSMutableArray array];
@@ -2008,6 +2927,13 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
             // existing song; refresh the menu even though no new song row was
             // created.
             [self reloadQueuePicker];
+            if ([q queueCount] == 0) {
+                NSAlert* alert = [[NSAlert alloc] init];
+                alert.messageText = strings::get(Str::open_no_compatible);
+                alert.informativeText = strings::get(Str::open_button_help);
+                [alert addButtonWithTitle:strings::get(Str::panel_ok)];
+                [alert runModal];
+            }
             return;
         }
         [self loadQueueIndex:firstAdded autoplay:NO];
@@ -2023,6 +2949,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)applyCollapseState:(BOOL)animated {
+    if (_reducedMotion) {
+        animated = NO;
+    }
     _miniProgress.hidden = !_collapsed;
     _collapseButton.image = tinted_symbol(_collapsed ? @"chevron.down" : @"chevron.up",
                                           10, NSFontWeightSemibold, ink_soft());
@@ -2117,6 +3046,14 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSPoint origin;
     if (game.has_value()) {
         origin = [self hudOriginForGameFrame:*game];
+        // Bring the game forward once at launch so it's ready to receive keys and
+        // the HUD (which only shows while Genshin is focused) is actually
+        // visible. Done regardless of the background-play setting: that setting
+        // governs whether playback needs focus, not this one-time launch focus.
+        if (!_didActivateGenshin) {
+            _didActivateGenshin = YES;
+            _genshin->activate_application();
+        }
     } else {
         const NSRect vf = NSScreen.mainScreen.visibleFrame;
         origin = NSMakePoint(NSMaxX(vf) - kW - 20, NSMaxY(vf) - h - 20);
@@ -2143,9 +3080,16 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 }
 
 - (void)panelMouseDown:(NSEvent*)event {
+    [_key_grid releaseHeldKey];
     _dragging = YES;
     _dragStartMouse = NSEvent.mouseLocation;
     _dragStartOrigin = self.window.frame.origin;
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+    // Never leave a synthetic key held when AppKit transfers focus to a menu,
+    // file picker, dashboard, or another application.
+    [_key_grid releaseHeldKey];
 }
 
 - (void)panelMouseDragged:(NSEvent*)event {
@@ -2176,6 +3120,23 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
             _hasUserOffset = YES;
         }
     }
+    // The focus timer intentionally ignores active drags. Reconcile once the
+    // drag ends so a moved HUD cannot remain at stale visibility/placement.
+    [self updateFocusAppearance];
+}
+
+- (void)menuDidBeginTracking:(NSNotification*)notification {
+    ++_menuTrackingDepth;
+    [self updateFocusAppearance];
+}
+
+- (void)menuDidEndTracking:(NSNotification*)notification {
+    _menuTrackingDepth = std::max<NSInteger>(0, _menuTrackingDepth - 1);
+    [self updateFocusAppearance];
+}
+
+- (void)workspaceFocusChanged:(NSNotification*)notification {
+    [self updateFocusAppearance];
 }
 
 #pragma mark - Refresh
@@ -2187,24 +3148,41 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     if (_dragging) {
         return;  // don't fight an active drag
     }
-    if (_genshin_pid == 0 ||
-        [NSRunningApplication runningApplicationWithProcessIdentifier:_genshin_pid] == nil) {
-        _genshin_pid = genshin_pid();
+    std::optional<NSRect> game;
+    if (_genshin_pid != 0) {
+        game = game_frame(_genshin_pid, nullptr);
     }
+    if (_genshin_pid == 0 ||
+        [NSRunningApplication runningApplicationWithProcessIdentifier:_genshin_pid] == nil ||
+        !game.has_value()) {
+        _genshin_pid = genshin_pid();
+        if (_genshin_pid != 0) {
+            game = game_frame(_genshin_pid, nullptr);
+        }
+    }
+    // Keystrokes go straight to this pid, so playback reaches the game even
+    // while it is in the background.
+    _keyboard->set_target_pid(_genshin_pid);
     const BOOL focused = genshin_is_focused(_genshin_pid);
 
     // Treat "we're driving our own UI" (pointer over the HUD, or the file
     // picker open) as not-a-real-blur, so those interactions don't hide the HUD
     // or pause playback.
-    const BOOL selfInteracting = _pointerInside || _openPanelActive;
+    const BOOL hudVisible = self.window.isVisible;
+    const BOOL pointerOverHud = hudVisible &&
+        NSPointInRect(NSEvent.mouseLocation, self.window.frame);
+    const BOOL selfInteracting = (hudVisible &&
+        (_pointerInside || pointerOverHud)) ||
+        _openPanelActive || _menuTrackingDepth > 0;
+
+    const PlaybackState playbackState = _playback->snapshot().state;
 
     // Auto-pause when Genshin loses focus to ANOTHER app — but not for the
     // brief blur caused by interacting with the HUD itself, otherwise pressing
     // play would instantly pause playback.
-    if (_autoPauseOnBlur && _wasFocused && !focused && !selfInteracting) {
-        if (_playback->snapshot().state == PlaybackState::playing) {
-            _playback->pause();
-        }
+    if (!_playInBackground && _autoPauseOnBlur && _wasFocused && !focused && !selfInteracting &&
+        playbackState == PlaybackState::playing) {
+        _playback->pause();
     }
     // Only update the focus edge-tracker once we're done with our own UI, so a
     // HUD click / picker doesn't register as a focus loss on the next real blur.
@@ -2212,28 +3190,43 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         _wasFocused = focused;
     }
 
-    // Keep the HUD visible while the pointer is over it or the picker is open
-    // (so you can use controls even though that unfocuses Genshin momentarily).
-    const BOOL shouldShow = focused || selfInteracting;
+    // Visibility follows Genshin focus. The HUD shows only when:
+    //   - Genshin is the frontmost app, or
+    //   - our own process is frontmost (file picker / dashboard in use), or
+    //   - Genshin isn't running at all (so the HUD is reachable to load songs).
+    // A running-but-hidden game (minimized, ⌘H, another Space) counts as
+    // unfocused — the HUD must never float over some other app.
+    NSRunningApplication* frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    const BOOL ownAppFrontmost = frontmost != nil &&
+        frontmost.processIdentifier == NSProcessInfo.processInfo.processIdentifier;
+    const BOOL genshinRunning = _genshin_pid != 0;
+    const BOOL shouldShow = focused || ownAppFrontmost || !genshinRunning;
 
+    // The practice dashboard floats too; hide and restore it alongside the HUD.
+    NSWindow* dashboard = _practiceDashboard.window;
     if (!shouldShow) {
         if (self.window.isVisible) {
             [self.window orderOut:nil];
         }
+        if (dashboard.isVisible) {
+            [dashboard orderOut:nil];
+            _dashboardHiddenForBlur = YES;
+        }
         return;
+    }
+    if (_dashboardHiddenForBlur) {
+        _dashboardHiddenForBlur = NO;
+        [dashboard orderFrontRegardless];
     }
 
     // Follow the current game window position (keeping the user's dragged
     // offset, if any).
-    if (_genshin_pid != 0) {
-        const std::optional<NSRect> game = game_frame(_genshin_pid, nullptr);
-        if (game.has_value()) {
+    if (_genshin_pid != 0 && game.has_value()) {
             const NSPoint want = [self hudOriginForGameFrame:*game];
             const NSPoint have = self.window.frame.origin;
             if (std::abs(want.x - have.x) > 0.5 || std::abs(want.y - have.y) > 0.5) {
                 [self.window setFrameOrigin:want];
             }
-        }
     }
 
     self.window.alphaValue = 1.0;
@@ -2245,9 +3238,30 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 - (void)refresh {
     _playback->practice_tick();
     const PlaybackSnapshot s = _playback->snapshot();
+    if (_playback->practice_mode()) {
+        [[self practiceDashboard] setSongKey:_titleLabel.stringValue];
+    }
+    // If the drill just moved on, the nested refresh it triggered has already
+    // drawn the new phrase; don't overwrite it from this stale snapshot.
+    if ([self updateDrill:s]) {
+        return;
+    }
+    [self applyMetronome];
     [_key_grid decayPulse];
     [_statusPill tick];
     _key_grid.practiceMode = _playback->practice_mode();
+    _key_grid.reducedMotion = _reducedMotion;
+    _key_grid.highContrast = _highContrast;
+
+    if (s.practice_beat_sequence != _lastMetronomeBeat) {
+        const BOOL shouldPlayMetronome = _metronomeMode == 1 &&
+            _playback->practice_mode() && _playback->practice_tempo();
+        _lastMetronomeBeat = s.practice_beat_sequence;
+        if (shouldPlayMetronome) {
+            NSSound* sound = [NSSound soundNamed:@"Tink"];
+            [sound play];
+        }
+    }
 
     _progress.progress = s.progress;
     _miniProgress.progress = s.progress;
@@ -2256,10 +3270,6 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _time.stringValue = format_time(s.elapsed);
     _duration.stringValue = format_time(s.duration);
     [_key_grid setActiveKeys:s.active_keys];
-    if (_practiceDashboard != nil) {
-        [_practiceDashboard setSongKey:_titleLabel.stringValue];
-    }
-
     // Idle hint: when stopped with a song loaded, glow the current note's keys
     // faintly so the grid has life at rest.
     if (s.state == PlaybackState::stopped && !s.current_note.empty()) {
@@ -2282,13 +3292,13 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         case PlaybackState::countdown:
             countdown_secs = (s.countdown_remaining.count() + 999) / 1000;
             _statusPill.tint = gold();
-            _statusPill.pulsing = YES;
+            _statusPill.pulsing = !_reducedMotion;
             _statusPill.toolTip = strings::get(Str::counting_in);
             _playPause.image = tinted_symbol(@"pause.fill", 18, NSFontWeightMedium, gold());
             break;
         case PlaybackState::playing:
             _statusPill.tint = gold();
-            _statusPill.pulsing = YES;
+            _statusPill.pulsing = !_reducedMotion;
             _statusPill.toolTip = strings::get(Str::playing);
             _playPause.image = tinted_symbol(@"pause.fill", 18, NSFontWeightMedium, gold());
             break;
@@ -2312,10 +3322,17 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _progress.alphaValue = controlsAlpha;
 
     NSString* phraseLabel = s.practice_phrase_count > 0
-        ? [NSString stringWithFormat:@"Phrase %lu/%lu",
+        ? [NSString stringWithFormat:strings::get(Str::learn_phrase_of),
             static_cast<unsigned long>(s.practice_phrase_index + 1),
             static_cast<unsigned long>(s.practice_phrase_count)]
         : @"";
+    if (!_drill.empty()) {
+        phraseLabel = [NSString stringWithFormat:@"%@ · %@",
+            [NSString stringWithFormat:strings::get(Str::drill_status),
+                static_cast<unsigned long>(_drillPos + 1),
+                static_cast<unsigned long>(_drill.size())],
+            phraseLabel];
+    }
     NSString* practiceFeedback = nil;
     switch (s.practice_feedback) {
         case PracticeInputResult::wrong:
@@ -2341,26 +3358,43 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         default:
             break;
     }
+    NSString* practiceCue = nil;
+    if (!s.current_note.empty()) {
+        NSString* current = [NSString stringWithUTF8String:s.current_note.c_str()];
+        if (_showUpcoming && !s.next_note.empty()) {
+            practiceCue = [NSString stringWithFormat:@"%@: %@  ·  %@: %@",
+                strings::get(Str::learn_now), current,
+                strings::get(Str::learn_next),
+                [NSString stringWithUTF8String:s.next_note.c_str()]];
+        } else {
+            practiceCue = [NSString stringWithFormat:@"%@: %@",
+                strings::get(Str::learn_now), current];
+        }
+    }
     if (_playback->practice_mode() && s.state == PlaybackState::playing) {
         _hint.textColor = gold();
-        if (s.current_note.empty()) {
+        if (practiceCue == nil) {
             _hint.stringValue = strings::get(Str::learn_complete);
         } else {
-            NSString* cue = [NSString stringWithFormat:strings::get(Str::learn_note),
-                [NSString stringWithUTF8String:s.current_note.c_str()]];
-            _hint.stringValue = practiceFeedback != nil
-                ? [NSString stringWithFormat:@"%@ · %@", practiceFeedback, cue]
-                : [NSString stringWithFormat:@"%@ · %@", phraseLabel, cue];
+            NSString* line = practiceFeedback != nil
+                ? [NSString stringWithFormat:@"%@ · %@", practiceFeedback, practiceCue]
+                : [NSString stringWithFormat:@"%@ · %@", phraseLabel, practiceCue];
+            // Show the combo once it's worth celebrating.
+            if (s.practice_stats.streak >= 5) {
+                line = [NSString stringWithFormat:@"%@ · %@", line,
+                    [NSString stringWithFormat:strings::get(Str::learn_streak),
+                        static_cast<unsigned long>(s.practice_stats.streak)]];
+            }
+            _hint.stringValue = line;
         }
     } else if (_playback->practice_mode() && s.state == PlaybackState::paused) {
         _hint.textColor = ink_soft();
-        _hint.stringValue = s.current_note.empty()
+        _hint.stringValue = practiceCue == nil
             ? strings::get(Str::learn_complete)
             : [NSString stringWithFormat:@"%@ · %@ · %@",
                 phraseLabel,
                 strings::get(Str::paused),
-                [NSString stringWithFormat:strings::get(Str::learn_note),
-                    [NSString stringWithUTF8String:s.current_note.c_str()]]];
+                practiceCue];
     } else if (_playback->practice_mode() && s.progress >= 1.0 && !empty) {
         _hint.textColor = gold();
         _hint.stringValue = strings::get(Str::learn_complete);
@@ -2374,12 +3408,128 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
             strings::get(Str::starting_in), countdown_secs];
     } else if (empty && s.state == PlaybackState::stopped) {
         _hint.textColor = ink_faint();
-        _hint.stringValue = strings::get(Str::open_to_begin);
+        _hint.stringValue = strings::get(Str::open_formats);
     } else {
         _hint.stringValue = @"";
     }
+    if (_flashHint != nil && NSDate.timeIntervalSinceReferenceDate < _flashHintUntil) {
+        _hint.textColor = gold();
+        _hint.stringValue = _flashHint;
+    } else {
+        _flashHint = nil;
+    }
+}
 
-    [self updateFocusAppearance];
+#pragma mark - Drill weakest phrases
+
+- (void)flashHint:(NSString*)message {
+    _flashHint = [message copy];
+    _flashHintUntil = NSDate.timeIntervalSinceReferenceDate + 4.0;
+    [self refresh];
+}
+
+// Gather the weakest practiced phrases across the whole playlist from saved
+// history (best accuracy below the solid threshold), weakest first.
+- (void)startDrill:(id)sender {
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    if (q == nil) {
+        return;
+    }
+    nlohmann::json history = nlohmann::json::object();
+    try {
+        history = nlohmann::json::parse(settings::get_json("practice_history", "{}"));
+    } catch (...) {
+    }
+    std::vector<DrillItem> candidates;
+    const NSInteger count = [q queueCount];
+    for (NSInteger i = 0; i < count && history.is_object(); ++i) {
+        const std::string title = [q queueResolvedTitleAtIndex:i].UTF8String ?: "";
+        if (!history.contains(title) || !history[title].is_object()) {
+            continue;
+        }
+        const nlohmann::json& song = history[title];
+        if (!song.contains("phrase_best") || !song["phrase_best"].is_array()) {
+            continue;
+        }
+        const nlohmann::json& bests = song["phrase_best"];
+        for (std::size_t phrase = 0; phrase < bests.size(); ++phrase) {
+            if (!bests[phrase].is_number()) {
+                continue;
+            }
+            const double best = bests[phrase].get<double>();
+            if (best > 0.0 && best < kDrillThreshold) {
+                candidates.push_back({i, phrase, best});
+            }
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const DrillItem& a, const DrillItem& b) { return a.best < b.best; });
+    if (candidates.size() > kDrillLength) {
+        candidates.resize(kDrillLength);
+    }
+    if (candidates.empty()) {
+        [self flashHint:strings::get(Str::drill_none)];
+        return;
+    }
+    _drill = std::move(candidates);
+    _drillPos = 0;
+    [self loadDrillItem];
+}
+
+- (void)loadDrillItem {
+    if (_drillPos >= _drill.size()) {
+        [self stopDrill:nil];
+        [self flashHint:strings::get(Str::drill_done)];
+        return;
+    }
+    const DrillItem item = _drill[_drillPos];
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    _drillLoading = YES;
+    if (!_playback->practice_mode()) {
+        _playback->set_practice_mode(true);
+        settings::set_bool(kSettingLearn, true);
+    }
+    if (q != nil && [q queueCurrentIndex] != item.song) {
+        [self loadQueueIndex:item.song autoplay:NO];
+    }
+    // Same song: jump in place (no stop, so no per-step session summary).
+    _playback->practice_jump_to_phrase(item.phrase, true);
+    [self startPlayback];
+    _drillLoading = NO;
+    [self refresh];
+}
+
+- (void)stopDrill:(id)sender {
+    _drill.clear();
+    _drillPos = 0;
+    _playback->practice_unpin_phrase();
+    [self refresh];
+}
+
+// Advance the drill when the pinned phrase is mastered; cancel it if the user
+// leaves the drill (switches songs, unpins, or leaves Learn mode). Returns YES
+// when it advanced (and therefore already refreshed the HUD).
+- (BOOL)updateDrill:(const PlaybackSnapshot&)s {
+    if (_drill.empty() || _drillLoading) {
+        return NO;
+    }
+    const DrillItem& item = _drill[_drillPos];
+    id<PlayerQueueDelegate> q = self.queueDelegate;
+    const bool onItem = _playback->practice_mode() && q != nil &&
+        [q queueCurrentIndex] == item.song &&
+        s.practice_stats.pinned_phrase == item.phrase;
+    if (!onItem) {
+        _drill.clear();
+        _drillPos = 0;
+        return NO;
+    }
+    if (item.phrase < s.practice_stats.phrases.size() &&
+        s.practice_stats.phrases[item.phrase].mastered) {
+        ++_drillPos;
+        [self loadDrillItem];
+        return YES;
+    }
+    return NO;
 }
 
 @end

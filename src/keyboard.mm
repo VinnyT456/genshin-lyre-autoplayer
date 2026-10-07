@@ -2,11 +2,11 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include "keyboard.h"
+#include "genshin.h"
 
-#include <algorithm>
+#include <cerrno>
 #include <chrono>
-#include <cmath>
-#include <random>
+#include <csignal>
 #include <thread>
 #include <unistd.h>
 
@@ -14,19 +14,7 @@ using namespace std;
 
 namespace {
 
-thread_local mt19937 rng{random_device{}()};
-
-int human_delay_ms(double mean, double deviation, int minimum, int maximum) {
-    normal_distribution<double> dist(mean, deviation);
-    const int sampled = static_cast<int>(std::lround(dist(rng)));
-    return std::clamp(sampled, minimum, maximum);
-}
-
-void sleep_ms(int ms) {
-    if (ms > 0) {
-        this_thread::sleep_for(chrono::milliseconds(ms));
-    }
-}
+constexpr chrono::milliseconds kKeyHoldDuration{35};
 
 CGEventSourceRef event_source() {
     static CGEventSourceRef source =
@@ -34,33 +22,44 @@ CGEventSourceRef event_source() {
     return source;
 }
 
-NSRunningApplication* genshin_app() {
-    for (NSRunningApplication* app in NSWorkspace.sharedWorkspace.runningApplications) {
-        if ([app.localizedName isEqualToString:@"Genshin Impact"]) {
-            return app;
-        }
-    }
-    return nil;
+// True while the process exists. kill(pid, 0) sends nothing; EPERM still means
+// the process is alive (we just can't signal it).
+bool process_alive(pid_t pid) {
+    return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
 }
 
-void post_event(CGEventRef event) {
-    NSRunningApplication* app = genshin_app();
-    if (app == nil) {
-        CGEventPost(kCGHIDEventTap, event);
+void prepare_target(pid_t pid, bool background) {
+    // Background play posts straight to the pid and never touches focus.
+    if (background) {
         return;
     }
-
-    if (!app.isActive) {
+    NSRunningApplication* app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (app != nil && !app.isActive) {
         [app activateWithOptions:NSApplicationActivateAllWindows];
         usleep(50000);
     }
+}
 
-    CGEventPostToPid(app.processIdentifier, event);
+void post_event(CGEventRef event, pid_t target_pid) {
+    if (target_pid == 0) {
+        return;
+    }
+
+    CGEventPostToPid(target_pid, event);
 }
 
 }  // namespace
 
 Keyboard::Keyboard() {
+    // Background playback is the safe default for every construction path;
+    // the HUD can still explicitly disable it for users who want Genshin
+    // activated before playback.
+    play_in_background.store(true, std::memory_order_relaxed);
+
+    // CGEventCreateKeyboardEvent expects macOS virtual keycodes. PlayCover
+    // translates these incoming virtual codes to the internal keymap codes
+    // stored in Genshin Impact.playmap.
     keycodes[Key::Q] = 12;
     keycodes[Key::W] = 13;
     keycodes[Key::E] = 14;
@@ -86,25 +85,62 @@ Keyboard::Keyboard() {
     keycodes[Key::M] = 46;
 }
 
+void Keyboard::set_play_in_background(bool enabled) {
+    play_in_background.store(enabled, std::memory_order_relaxed);
+}
+
+bool Keyboard::plays_in_background() const {
+    return play_in_background.load(std::memory_order_relaxed);
+}
+
+void Keyboard::set_target_pid(pid_t pid) {
+    target_pid.store(pid, std::memory_order_relaxed);
+}
+
+// Use the cached Genshin pid while that process is alive; only fall back to
+// the (much slower) window-list scan when it is unknown or has exited. This
+// keeps per-note latency low and pins keys to one process.
+pid_t Keyboard::resolve_target_pid() {
+    const pid_t cached = target_pid.load(std::memory_order_relaxed);
+    if (process_alive(cached)) {
+        return cached;
+    }
+    const pid_t pid = find_genshin_pid();
+    target_pid.store(pid, std::memory_order_relaxed);
+    return pid;
+}
+
 void Keyboard::keyDown(Key key) {
+    const pid_t pid = resolve_target_pid();
+    if (pid == 0) {
+        return;
+    }
+    prepare_target(pid, plays_in_background());
+
     CGEventRef key_down =
         CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), true);
     if (key_down == nullptr) {
         return;
     }
 
-    post_event(key_down);
+    post_event(key_down, pid);
     CFRelease(key_down);
 }
 
 void Keyboard::keyUp(Key key) {
+    const pid_t pid = resolve_target_pid();
+    if (pid == 0) {
+        return;
+    }
+    prepare_target(pid, plays_in_background());
+
     CGEventRef key_up =
         CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), false);
     if (key_up == nullptr) {
         return;
     }
 
-    post_event(key_up);
+    post_event(key_up, pid);
     CFRelease(key_up);
 }
 
@@ -113,21 +149,33 @@ void Keyboard::press(vector<Key> keys) {
         return;
     }
 
-    // Human timing clusters around a typical value instead of treating every
-    // point in a broad range as equally likely. Keep jitter short because the
-    // playback scheduler already determines the intended note time.
-    sleep_ms(human_delay_ms(5.0, 2.5, 1, 12));
+    // Resolve the destination once per chord so key-downs and key-ups stay
+    // tightly grouped and all land on the same process.
+    const pid_t target_pid = resolve_target_pid();
+    if (target_pid == 0) {
+        return;
+    }
+    prepare_target(target_pid, plays_in_background());
 
-    // A chord is one musical event. Post every key-down in one tight cluster
-    // so the game receives the notes together instead of as a short arpeggio.
     for (Key key : keys) {
-        keyDown(key);
+        CGEventRef key_down =
+            CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), true);
+        if (key_down != nullptr) {
+            post_event(key_down, target_pid);
+            CFRelease(key_down);
+        }
     }
 
-    // Most taps sit near 45 ms, with occasional shorter or longer presses.
-    sleep_ms(human_delay_ms(45.0, 10.0, 26, 72));
+    // A fixed tap duration keeps the musical timing deterministic while still
+    // giving the game enough time to recognize each note.
+    this_thread::sleep_for(kKeyHoldDuration);
 
     for (Key key : keys) {
-        keyUp(key);
+        CGEventRef key_up =
+            CGEventCreateKeyboardEvent(event_source(), keycodes.at(key), false);
+        if (key_up != nullptr) {
+            post_event(key_up, target_pid);
+            CFRelease(key_up);
+        }
     }
 }

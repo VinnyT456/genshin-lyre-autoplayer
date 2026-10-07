@@ -5,7 +5,8 @@ FRAMEWORKS = -framework Foundation -framework AppKit -framework CoreGraphics \
 	-framework ApplicationServices -framework UniformTypeIdentifiers \
 	-framework QuartzCore
 
-TARGET = macauto.out
+BUILD_DIR = build
+TARGET = $(BUILD_DIR)/macauto.out
 SRC = src/main.mm src/PlayerWindow.mm src/keyboard.mm src/genshin.mm \
 	src/parser.cpp src/playback_controller.cpp src/settings.cpp \
 	src/theme.mm src/strings.mm src/practice_dashboard.mm
@@ -20,6 +21,7 @@ endif
 all: build
 
 build:
+	mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRC) -o $(TARGET) $(FRAMEWORKS) $(LDFLAGS)
 
 # make run                              # HUD, open songs from UI

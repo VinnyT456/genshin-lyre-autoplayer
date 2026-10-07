@@ -18,6 +18,9 @@ class PlaybackController;
 - (BOOL)queueLoadIndex:(NSInteger)index sourceIndex:(NSInteger)sourceIndex;
 - (NSString*)queueTitleAtIndex:(NSInteger)index;
 - (NSInteger)queueBpmAtIndex:(NSInteger)index;
+// The song's real title (from its file metadata) without loading it into
+// playback; parsed once and cached. Used to match practice history by title.
+- (NSString*)queueResolvedTitleAtIndex:(NSInteger)index;
 // A matching .genshinsheet/.mid pair is one playlist song with alternate
 // sources shown in its popup submenu.
 - (NSInteger)queueSourceCountAtIndex:(NSInteger)index;
@@ -25,6 +28,13 @@ class PlaybackController;
 - (NSInteger)queueSelectedSourceIndexAtIndex:(NSInteger)index;
 // Append supported song files or folders; returns number of songs added.
 - (NSInteger)queueAddPaths:(NSArray<NSString*>*)paths;
+// Queue organization controls exposed by the playlist popup.
+- (BOOL)queueMoveCurrentBy:(NSInteger)offset;
+- (BOOL)queueRemoveIndex:(NSInteger)index;
+- (void)queueClear;
+- (BOOL)queueIsFavoriteAtIndex:(NSInteger)index;
+- (void)queueToggleFavoriteAtIndex:(NSInteger)index;
+- (NSArray<NSNumber*>*)queueRecentIndexes;
 @end
 
 @interface PlayerWindowController : NSWindowController

@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <optional>
 #include <vector>
 
 #include "keyboard.h"
@@ -25,6 +26,14 @@ enum class PracticeInputResult {
     advanced,
     phrase_completed,
     completed
+};
+
+struct PracticeTimingWindows {
+    std::chrono::milliseconds early{220};
+    std::chrono::milliseconds miss{450};
+    // Zero preserves the historical behavior: a chord may be assembled until
+    // the normal miss window. A positive value limits the assembly interval.
+    std::chrono::milliseconds chord{0};
 };
 
 struct PracticePhraseSnapshot {
@@ -52,7 +61,24 @@ struct PracticeStatsSnapshot {
     std::size_t early_inputs = 0;
     std::size_t late_inputs = 0;
     std::size_t missed_notes = 0;
+    // Consecutive notes played without a wrong key or miss, and the session max.
+    std::size_t streak = 0;
+    std::size_t best_streak = 0;
+    // Song-speed practice only: signed offset of each accepted input from its
+    // target (negative = early/rushing, positive = late/dragging), binned over
+    // [offset_min_ms, offset_max_ms] for the dashboard histogram.
+    std::size_t offset_samples = 0;
+    std::chrono::milliseconds average_offset{0};
+    int offset_min_ms = 0;
+    int offset_max_ms = 0;
+    std::vector<std::size_t> offset_bins;
+    // Increments whenever stats reset, so observers can spot a new session.
+    std::size_t session = 0;
+    // Phrase pinned for looping (jump-to-phrase / drills), or kNoPhrase.
+    std::size_t pinned_phrase = static_cast<std::size_t>(-1);
 };
+
+constexpr std::size_t kNoPhrase = static_cast<std::size_t>(-1);
 
 struct PlaybackSnapshot {
     PlaybackState state;
@@ -67,6 +93,7 @@ struct PlaybackSnapshot {
     PracticeInputResult practice_feedback;
     std::size_t practice_pressed_count;
     std::size_t practice_expected_count;
+    std::size_t practice_beat_sequence;
     PracticeStatsSnapshot practice_stats;
     bool loop;                                        // whole-song loop enabled
     double speed;                                     // playback rate multiplier
@@ -98,6 +125,7 @@ public:
 
     // Count-in length before playback actually fires keys.
     void set_countdown(std::chrono::milliseconds duration);
+    std::chrono::milliseconds countdown_duration() const;
 
     // Learn mode: the song advances only when the user supplies the expected
     // key or chord. It never posts automatic keystrokes.
@@ -105,6 +133,30 @@ public:
     bool practice_mode() const;
     void set_practice_tempo(bool enabled);
     bool practice_tempo() const;
+    void set_practice_auto_speed(bool enabled);
+    bool practice_auto_speed() const;
+    // Loop-until-mastered: a phrase repeats in place until it is played
+    // cleanly enough to count as mastered, then playback advances to the next
+    // phrase automatically. Disabled = phrases advance on every completion.
+    void set_practice_lock_until_mastered(bool enabled);
+    bool practice_lock_until_mastered() const;
+    // Speed ramp: when auto speed is on, a fresh practice run starts at this
+    // speed (e.g. 0.5) and climbs 0.05x per clean phrase. 0 = keep current speed.
+    void set_practice_ramp_start(double speed);
+    double practice_ramp_start() const;
+    // Jump straight to a phrase. With pin = true the phrase then repeats in
+    // place until unpinned. If stopped, the next run starts there.
+    void practice_jump_to_phrase(std::size_t phrase, bool pin);
+    void practice_unpin_phrase();
+    // Steady metronome on the song's beat during song-speed practice (count-in
+    // included). 0 BPM disables it. practice_metronome() is cheap to poll:
+    // returns the tick counter and whether the latest tick was a downbeat.
+    void set_metronome_bpm(int bpm);
+    std::pair<std::size_t, bool> practice_metronome() const;
+    void set_practice_latency_offset(std::chrono::milliseconds offset);
+    std::chrono::milliseconds practice_latency_offset() const;
+    void set_practice_timing_windows(PracticeTimingWindows windows);
+    PracticeTimingWindows practice_timing_windows() const;
     void practice_tick();
     PracticeInputResult practice_key(Key key);
     void practice_restart_phrase();
@@ -139,6 +191,7 @@ private:
     std::chrono::steady_clock::time_point paused_at_;
     std::chrono::steady_clock::time_point countdown_end_;
     std::chrono::milliseconds paused_elapsed_{0};
+    bool paused_from_countdown_ = false;
     std::chrono::milliseconds countdown_{std::chrono::milliseconds(0)};
     bool loop_ = false;
     bool practice_mode_ = false;
@@ -162,7 +215,25 @@ private:
     std::chrono::milliseconds practice_response_total_{0};
     std::chrono::milliseconds practice_last_response_{0};
     std::chrono::steady_clock::time_point practice_target_started_at_;
+    std::chrono::steady_clock::time_point practice_chord_started_at_;
+    std::size_t practice_beat_sequence_ = 0;
+    bool practice_beat_emitted_ = false;
     bool practice_tempo_ = false;
+    bool practice_auto_speed_ = false;
+    bool practice_lock_until_mastered_ = false;
+    double practice_ramp_start_ = 0.0;
+    std::size_t practice_streak_ = 0;
+    std::size_t practice_best_streak_ = 0;
+    std::vector<int> practice_offsets_;
+    std::optional<int> practice_pending_offset_;
+    std::size_t practice_session_ = 0;
+    std::size_t practice_pinned_phrase_ = kNoPhrase;
+    std::chrono::milliseconds metronome_interval_{0};
+    std::optional<long long> metronome_last_beat_;
+    std::size_t metronome_ticks_ = 0;
+    bool metronome_downbeat_ = false;
+    std::chrono::milliseconds practice_latency_offset_{0};
+    PracticeTimingWindows practice_timing_windows_;
     bool practice_late_current_ = false;
     PracticeInputResult practice_feedback_ = PracticeInputResult::ignored;
     double speed_ = 1.0;
@@ -172,6 +243,8 @@ private:
     void reset_practice_locked();
     void reset_practice_stats_locked();
     void start_practice_target_locked();
+    // Re-anchor the song-speed timeline so note `index` is due after `lead_in`.
+    void rewind_timeline_locked(std::size_t index, std::chrono::milliseconds lead_in);
     PracticeInputResult advance_practice_note_locked(
         bool completed, PracticeInputResult feedback,
         std::chrono::steady_clock::time_point now);

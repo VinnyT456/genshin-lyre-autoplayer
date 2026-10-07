@@ -75,6 +75,22 @@ void set_bool(const std::string& key, bool value) {
     save_locked(j);
 }
 
+int get_int(const std::string& key, int fallback) {
+    std::lock_guard lock(g_mutex);
+    const nlohmann::json j = load_locked();
+    if (j.contains(key) && j[key].is_number_integer()) {
+        return j[key].get<int>();
+    }
+    return fallback;
+}
+
+void set_int(const std::string& key, int value) {
+    std::lock_guard lock(g_mutex);
+    nlohmann::json j = load_locked();
+    j[key] = value;
+    save_locked(j);
+}
+
 std::string get_string(const std::string& key, const std::string& fallback) {
     std::lock_guard lock(g_mutex);
     const nlohmann::json j = load_locked();

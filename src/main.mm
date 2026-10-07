@@ -150,6 +150,7 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
                      playback:(PlaybackController*)playback;
 // Load index 0 eagerly so the HUD opens on a real song; returns NO if empty.
 - (BOOL)primeFirst;
+- (void)rememberRecentIndex:(NSInteger)index;
 @end
 
 @implementation SongQueue {
@@ -223,6 +224,7 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
             _bpms[static_cast<size_t>(index)] = parser.song_metadata().bpm;
             _playback->set_notes(std::move(notes));
             _current = index;
+            [self rememberRecentIndex:index];
             return YES;
         } catch (const std::exception& error) {
             std::cerr << "Failed to load " << song.sources[candidate] << ": "
@@ -278,6 +280,138 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
 // Persist the playlist so it reloads on next launch (local hud-settings.json).
 - (void)persistPaths {
     settings::set_string_array("playlist", flatten_playlist(_songs));
+}
+
+- (void)rememberRecentIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size()) ||
+        _songs[static_cast<size_t>(index)].sources.empty()) {
+        return;
+    }
+    const std::string& path = _songs[static_cast<size_t>(index)].sources.front();
+    std::vector<std::string> recent = settings::get_string_array("recent_songs");
+    recent.erase(std::remove(recent.begin(), recent.end(), path), recent.end());
+    recent.insert(recent.begin(), path);
+    if (recent.size() > 12) {
+        recent.resize(12);
+    }
+    settings::set_string_array("recent_songs", recent);
+}
+
+- (BOOL)queueMoveCurrentBy:(NSInteger)offset {
+    if (_current < 0 || _current >= static_cast<NSInteger>(_songs.size()) ||
+        (offset != -1 && offset != 1)) {
+        return NO;
+    }
+    const NSInteger target = _current + offset;
+    if (target < 0 || target >= static_cast<NSInteger>(_songs.size())) {
+        return NO;
+    }
+    std::swap(_songs[static_cast<size_t>(_current)], _songs[static_cast<size_t>(target)]);
+    std::swap(_selected_sources[static_cast<size_t>(_current)],
+              _selected_sources[static_cast<size_t>(target)]);
+    std::swap(_titles[static_cast<size_t>(_current)], _titles[static_cast<size_t>(target)]);
+    std::swap(_bpms[static_cast<size_t>(_current)], _bpms[static_cast<size_t>(target)]);
+    _current = target;
+    [self persistPaths];
+    return YES;
+}
+
+- (BOOL)queueRemoveIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
+        return NO;
+    }
+    const BOOL wasCurrent = index == _current;
+    _playback->stop();
+    _songs.erase(_songs.begin() + index);
+    _selected_sources.erase(_selected_sources.begin() + index);
+    _titles.erase(_titles.begin() + index);
+    _bpms.erase(_bpms.begin() + index);
+    if (_songs.empty()) {
+        _current = -1;
+        _playback->set_notes({});
+    } else if (wasCurrent) {
+        _current = std::min(index, static_cast<NSInteger>(_songs.size()) - 1);
+        [self queueLoadIndex:_current sourceIndex:-1];
+    } else if (_current > index) {
+        --_current;
+    }
+    [self persistPaths];
+    return YES;
+}
+
+- (void)queueClear {
+    _playback->stop();
+    _songs.clear();
+    _selected_sources.clear();
+    _titles.clear();
+    _bpms.clear();
+    _current = -1;
+    _playback->set_notes({});
+    [self persistPaths];
+}
+
+- (BOOL)queueIsFavoriteAtIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size()) ||
+        _songs[static_cast<size_t>(index)].sources.empty()) {
+        return NO;
+    }
+    const std::string path = _songs[static_cast<size_t>(index)].sources.front();
+    const std::vector<std::string> favorites = settings::get_string_array("favorites");
+    return std::find(favorites.begin(), favorites.end(), path) != favorites.end();
+}
+
+- (void)queueToggleFavoriteAtIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size()) ||
+        _songs[static_cast<size_t>(index)].sources.empty()) {
+        return;
+    }
+    const std::string path = _songs[static_cast<size_t>(index)].sources.front();
+    std::vector<std::string> favorites = settings::get_string_array("favorites");
+    const auto found = std::find(favorites.begin(), favorites.end(), path);
+    if (found == favorites.end()) {
+        favorites.insert(favorites.begin(), path);
+    } else {
+        favorites.erase(found);
+    }
+    settings::set_string_array("favorites", favorites);
+}
+
+- (NSArray<NSNumber*>*)queueRecentIndexes {
+    NSMutableArray<NSNumber*>* result = [NSMutableArray array];
+    const std::vector<std::string> recent = settings::get_string_array("recent_songs");
+    for (const std::string& recentPath : recent) {
+        for (size_t i = 0; i < _songs.size(); ++i) {
+            const auto& sources = _songs[i].sources;
+            if (std::find(sources.begin(), sources.end(), recentPath) != sources.end()) {
+                NSNumber* number = @(static_cast<NSInteger>(i));
+                if (![result containsObject:number]) {
+                    [result addObject:number];
+                }
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+- (NSString*)queueResolvedTitleAtIndex:(NSInteger)index {
+    if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
+        return @"";
+    }
+    const size_t i = static_cast<size_t>(index);
+    if (_titles[i].empty() && !_songs[i].sources.empty()) {
+        const size_t source = _selected_sources[i] < _songs[i].sources.size()
+            ? _selected_sources[i] : 0;
+        try {
+            GenshinSheetParser parser(_songs[i].sources[source]);
+            parser.translate();
+            _titles[i] = parser.song_metadata().title;
+            _bpms[i] = parser.song_metadata().bpm;
+        } catch (const std::exception&) {
+            // Unreadable song: fall back to the filename-based title.
+        }
+    }
+    return [self queueTitleAtIndex:index];
 }
 
 - (NSInteger)queueBpmAtIndex:(NSInteger)index {
@@ -371,24 +505,34 @@ int main(int argc, const char* argv[]) {
 
             Genshin genshin;
             genshin.locate_application();
-            genshin.activate_application();
+            const bool play_in_background =
+                settings::get_bool("play_in_background", true);
+            if (!play_in_background) {
+                genshin.activate_application();
+            }
 
             Keyboard keyboard;
+            keyboard.set_play_in_background(play_in_background);
             PlaybackController playback({}, keyboard);
 
             SongQueue* queue = [[SongQueue alloc] initWithPaths:sheets
                                                        playback:&playback];
+            // Keep the HUD controller alive for the entire AppKit run loop.
+            // The window does not own its NSWindowController strongly, so a
+            // controller created only inside the conditional can be released
+            // as soon as that scope ends, taking its timers and HUD with it.
+            PlayerWindowController* hud_controller = nil;
 
             if (show_hud) {
-                PlayerWindowController* controller = [[PlayerWindowController alloc]
+                hud_controller = [[PlayerWindowController alloc]
                     initWithPlayback:&playback
                              genshin:&genshin
                             keyboard:&keyboard
                                title:@"No song selected"
                                  bpm:0];
-                controller.queueDelegate = queue;
+                hud_controller.queueDelegate = queue;
                 if (!sheets.empty()) {
-                    [controller loadQueueIndex:0 autoplay:NO];
+                    [hud_controller loadQueueIndex:0 autoplay:NO];
                 }
                 // User presses play (with count-in) when ready.
             } else {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
@@ -14,6 +15,28 @@ enum SongType {
     Recorded,
     Midi
 };
+
+struct MidiNote {
+    uint8_t pitch = 0;
+};
+
+struct KeySignature {
+    int8_t sharps_flats = 0;
+    bool minor = false;
+};
+
+// Key-aware, octave-optimized MIDI transposition helpers. A signed shift is
+// applied uniformly; unsupported pitches are never individually snapped.
+char midi_to_key(uint8_t pitch);
+bool is_lyre_playable_pitch(int pitch);
+int calculate_base_transposition(const KeySignature& key_signature);
+int calculate_transposition(const vector<MidiNote>& notes,
+                            const KeySignature& key_signature);
+
+// Returns false if one or more shifted pitches would leave MIDI's 0..127
+// range.
+bool transpose_notes(vector<MidiNote>& notes, int semitones);
+
 struct SongMetadata {
     string title;
     int bpm = 0;

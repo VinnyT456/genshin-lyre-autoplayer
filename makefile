@@ -7,13 +7,18 @@ FRAMEWORKS = -framework Foundation -framework AppKit -framework CoreGraphics \
 
 BUILD_DIR = build
 TARGET = $(BUILD_DIR)/macauto.out
-SRC = src/main.mm src/PlayerWindow.mm src/keyboard.mm src/genshin.mm \
-	src/parser.cpp src/playback_controller.cpp src/settings.cpp \
-	src/theme.mm src/strings.mm src/practice_dashboard.mm
+SRC = src/main.mm \
+	src/ui/PlayerWindow.mm src/ui/practice_dashboard.mm \
+	src/ui/note_highway.mm src/ui/key_overlay.mm \
+	src/ui/key_layout.mm src/ui/key_calibration.mm src/ui/settings_window.mm src/ui/song_library.mm \
+	src/ui/theme.mm src/ui/strings.mm \
+	src/app/keyboard.mm src/app/genshin.mm src/app/settings.cpp \
+	src/playback/parser.cpp src/playback/playback_controller.cpp
 
 NLOHMANN_INCLUDE ?= $(firstword $(wildcard /opt/homebrew/include /usr/local/include))
+INCLUDES = -Isrc -Isrc/app -Isrc/playback -Isrc/ui
 ifneq ($(NLOHMANN_INCLUDE),)
-INCLUDES = -I$(NLOHMANN_INCLUDE)
+INCLUDES += -I$(NLOHMANN_INCLUDE)
 endif
 
 .PHONY: all build run clean

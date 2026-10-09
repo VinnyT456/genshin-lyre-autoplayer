@@ -1,7 +1,12 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 
+#include <sys/stat.h>
+
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -140,11 +145,84 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     return paths;
 }
 
+// A song file parsed once: its notes and metadata. Reused until the file
+// changes on disk (size or modification time), so switching songs and
+// listing titles never re-parse.
+struct ParsedSong {
+    std::vector<Note> notes;
+    SongMetadata metadata;
+    off_t size = -1;
+    struct timespec modified = {};
+};
+
+class SongCache {
+public:
+    // The parsed song, parsing it first on a miss or when the file changed.
+    // Throws what the parser throws. Safe from any thread.
+    std::shared_ptr<const ParsedSong> get(const std::string& path) {
+        struct stat st {};
+        const bool exists = stat(path.c_str(), &st) == 0;
+        {
+            std::lock_guard lock(_mutex);
+            const auto found = _songs.find(path);
+            if (found != _songs.end() && exists && found->second->size == st.st_size &&
+                found->second->modified.tv_sec == st.st_mtimespec.tv_sec &&
+                found->second->modified.tv_nsec == st.st_mtimespec.tv_nsec) {
+                return found->second;
+            }
+        }
+        auto parsed = std::make_shared<ParsedSong>();
+        GenshinSheetParser parser(path);
+        parsed->notes = parser.translate();
+        parsed->metadata = parser.song_metadata();
+        if (exists) {
+            parsed->size = st.st_size;
+            parsed->modified = st.st_mtimespec;
+        }
+        std::lock_guard lock(_mutex);
+        _songs[path] = parsed;
+        return parsed;
+    }
+
+    // Already-parsed song, or null. Never touches the disk.
+    std::shared_ptr<const ParsedSong> peek(const std::string& path) {
+        std::lock_guard lock(_mutex);
+        const auto found = _songs.find(path);
+        return found != _songs.end() ? found->second : nullptr;
+    }
+
+private:
+    std::mutex _mutex;
+    std::unordered_map<std::string, std::shared_ptr<const ParsedSong>> _songs;
+};
+
+SongCache& song_cache() {
+    static SongCache cache;
+    return cache;
+}
+
+// Parses every song on a background queue so the first pick of each is
+// instant and the library shows real titles and BPM straight away.
+void prewarm_songs(std::vector<std::string> paths) {
+    static dispatch_queue_t queue = dispatch_queue_create(
+        "lyre.song-cache", dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    dispatch_async(queue, ^{
+        for (const std::string& path : paths) {
+            try {
+                song_cache().get(path);
+            } catch (const std::exception&) {
+                // Reported if the user actually picks it.
+            }
+        }
+    });
+}
+
 }  // namespace
 
 // Owns the playlist of song paths and swaps songs into the shared
-// PlaybackController on demand. Parsing is lazy (per load) so a big folder
-// costs nothing until a song is selected.
+// PlaybackController on demand. Songs are parsed once on a background queue
+// (see SongCache) so picking one is instant.
 @interface SongQueue : NSObject <PlayerQueueDelegate>
 - (instancetype)initWithPaths:(std::vector<std::string>)paths
                      playback:(PlaybackController*)playback;
@@ -176,6 +254,7 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
         _playback = playback;
         if (!_songs.empty()) {
             [self persistPaths];
+            prewarm_songs(flatten_playlist(_songs));
         }
     }
     return self;
@@ -214,15 +293,15 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     for (size_t attempt = 0; attempt < attempts; ++attempt) {
         const size_t candidate = (preferred_source + attempt) % song.sources.size();
         try {
-            GenshinSheetParser parser(song.sources[candidate]);
-            std::vector<Note> notes = parser.translate();
-            if (notes.empty()) {
+            const std::shared_ptr<const ParsedSong> parsed =
+                song_cache().get(song.sources[candidate]);
+            if (parsed->notes.empty()) {
                 throw std::runtime_error("song contains no playable notes");
             }
             _selected_sources[static_cast<size_t>(index)] = candidate;
-            _titles[static_cast<size_t>(index)] = parser.song_metadata().title;
-            _bpms[static_cast<size_t>(index)] = parser.song_metadata().bpm;
-            _playback->set_notes(std::move(notes));
+            _titles[static_cast<size_t>(index)] = parsed->metadata.title;
+            _bpms[static_cast<size_t>(index)] = parsed->metadata.bpm;
+            _playback->set_notes(parsed->notes);
             _current = index;
             [self rememberRecentIndex:index];
             return YES;
@@ -242,6 +321,7 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     if (index < 0 || index >= static_cast<NSInteger>(_songs.size())) {
         return @"Untitled";
     }
+    [self fillMetadataFromCache:index];
     const std::string& t = _titles[index];
     if (!t.empty()) {
         return [NSString stringWithUTF8String:t.c_str()];
@@ -273,6 +353,7 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     }
     if (added > 0 || paths.count > 0) {
         [self persistPaths];
+        prewarm_songs(flatten_playlist(_songs));   // cached ones return at once
     }
     return added;
 }
@@ -312,6 +393,31 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     std::swap(_titles[static_cast<size_t>(_current)], _titles[static_cast<size_t>(target)]);
     std::swap(_bpms[static_cast<size_t>(_current)], _bpms[static_cast<size_t>(target)]);
     _current = target;
+    [self persistPaths];
+    return YES;
+}
+
+- (BOOL)queueMoveIndex:(NSInteger)from to:(NSInteger)to {
+    const NSInteger count = static_cast<NSInteger>(_songs.size());
+    if (from < 0 || from >= count || to < 0 || to >= count || from == to) {
+        return NO;
+    }
+    auto move = [&](auto& v) {
+        auto item = std::move(v[static_cast<size_t>(from)]);
+        v.erase(v.begin() + from);
+        v.insert(v.begin() + to, std::move(item));
+    };
+    move(_songs);
+    move(_selected_sources);
+    move(_titles);
+    move(_bpms);
+    if (_current == from) {
+        _current = to;
+    } else if (from < _current && to >= _current) {
+        --_current;
+    } else if (from > _current && to <= _current) {
+        ++_current;
+    }
     [self persistPaths];
     return YES;
 }
@@ -403,10 +509,9 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
         const size_t source = _selected_sources[i] < _songs[i].sources.size()
             ? _selected_sources[i] : 0;
         try {
-            GenshinSheetParser parser(_songs[i].sources[source]);
-            parser.translate();
-            _titles[i] = parser.song_metadata().title;
-            _bpms[i] = parser.song_metadata().bpm;
+            const auto parsed = song_cache().get(_songs[i].sources[source]);
+            _titles[i] = parsed->metadata.title;
+            _bpms[i] = parsed->metadata.bpm;
         } catch (const std::exception&) {
             // Unreadable song: fall back to the filename-based title.
         }
@@ -414,10 +519,25 @@ std::vector<std::string> flatten_playlist(const std::vector<PlaylistEntry>& song
     return [self queueTitleAtIndex:index];
 }
 
+// Copy title/BPM from an already-parsed song (no disk access).
+- (void)fillMetadataFromCache:(NSInteger)index {
+    const size_t i = static_cast<size_t>(index);
+    if (!_titles[i].empty() || _songs[i].sources.empty()) {
+        return;
+    }
+    const size_t source = _selected_sources[i] < _songs[i].sources.size()
+        ? _selected_sources[i] : 0;
+    if (const auto parsed = song_cache().peek(_songs[i].sources[source])) {
+        _titles[i] = parsed->metadata.title;
+        _bpms[i] = parsed->metadata.bpm;
+    }
+}
+
 - (NSInteger)queueBpmAtIndex:(NSInteger)index {
     if (index < 0 || index >= static_cast<NSInteger>(_bpms.size())) {
         return 0;
     }
+    [self fillMetadataFromCache:index];
     return _bpms[index];
 }
 

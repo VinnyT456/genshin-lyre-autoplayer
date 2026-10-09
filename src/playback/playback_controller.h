@@ -80,6 +80,20 @@ struct PracticeStatsSnapshot {
 
 constexpr std::size_t kNoPhrase = static_cast<std::size_t>(-1);
 
+// Cheap per-frame state for the falling-notes view (no stats work).
+struct HighwayClock {
+    // Continuous song position in ms. Negative during a count-in, so notes
+    // can fall in before the song starts. In wait-for-input practice it is the
+    // timestamp of the note being waited on.
+    double song_ms = 0.0;
+    PlaybackState state = PlaybackState::stopped;
+    bool practice = false;
+    bool tempo = false;              // song-speed practice
+    std::size_t practice_index = 0;  // note being waited on (practice)
+    double speed = 1.0;
+    std::size_t notes_revision = 0;  // changes whenever the note list changes
+};
+
 struct PlaybackSnapshot {
     PlaybackState state;
     std::chrono::milliseconds elapsed;
@@ -166,6 +180,8 @@ public:
     void set_on_finished(std::function<void()> callback);
 
     PlaybackSnapshot snapshot() const;
+    HighwayClock highway_clock() const;
+    std::vector<Note> notes() const;  // copy; refetch when notes_revision changes
     std::size_t note_count() const;
 
 private:
@@ -227,6 +243,7 @@ private:
     std::vector<int> practice_offsets_;
     std::optional<int> practice_pending_offset_;
     std::size_t practice_session_ = 0;
+    std::size_t notes_revision_ = 1;
     std::size_t practice_pinned_phrase_ = kNoPhrase;
     std::chrono::milliseconds metronome_interval_{0};
     std::optional<long long> metronome_last_beat_;

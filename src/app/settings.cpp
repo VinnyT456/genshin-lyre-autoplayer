@@ -1,6 +1,7 @@
 #include "settings.h"
 
 #include <mach-o/dyld.h>
+#include <sys/stat.h>
 
 #include <cstdint>
 #include <fstream>
@@ -26,18 +27,54 @@ std::string executable_dir() {
     return slash == std::string::npos ? "." : buffer.substr(0, slash);
 }
 
-nlohmann::json load_locked() {
+// The parsed file is kept in memory, so reads cost no disk I/O or JSON
+// parsing. It is re-read only if the file changes underneath us (edited by
+// hand, or deleted to reset).
+nlohmann::json g_cache;
+bool g_loaded = false;
+struct timespec g_stamp = {};
+off_t g_size = -1;
+
+bool file_changed_locked() {
+    struct stat st {};
+    if (stat(path().c_str(), &st) != 0) {
+        return g_size != -1;
+    }
+    return st.st_size != g_size || st.st_mtimespec.tv_sec != g_stamp.tv_sec ||
+           st.st_mtimespec.tv_nsec != g_stamp.tv_nsec;
+}
+
+void remember_stamp_locked() {
+    struct stat st {};
+    if (stat(path().c_str(), &st) == 0) {
+        g_stamp = st.st_mtimespec;
+        g_size = st.st_size;
+    } else {
+        g_stamp = {};
+        g_size = -1;
+    }
+}
+
+nlohmann::json& load_locked() {
+    if (g_loaded && !file_changed_locked()) {
+        return g_cache;
+    }
+    g_loaded = true;
+    g_cache = nlohmann::json::object();
     std::ifstream in(path());
-    if (!in.is_open()) {
-        return nlohmann::json::object();
+    if (in.is_open()) {
+        try {
+            nlohmann::json j;
+            in >> j;
+            if (j.is_object()) {
+                g_cache = std::move(j);
+            }
+        } catch (...) {
+            // corrupt file → start fresh
+        }
     }
-    try {
-        nlohmann::json j;
-        in >> j;
-        return j.is_object() ? j : nlohmann::json::object();
-    } catch (...) {
-        return nlohmann::json::object();  // corrupt file → start fresh
-    }
+    remember_stamp_locked();
+    return g_cache;
 }
 
 void save_locked(const nlohmann::json& j) {
@@ -45,6 +82,8 @@ void save_locked(const nlohmann::json& j) {
     if (out.is_open()) {
         out << j.dump(2) << '\n';
     }
+    out.close();
+    remember_stamp_locked();
 }
 
 }  // namespace
@@ -61,7 +100,7 @@ bool has(const std::string& key) {
 
 bool get_bool(const std::string& key, bool fallback) {
     std::lock_guard lock(g_mutex);
-    const nlohmann::json j = load_locked();
+    const nlohmann::json& j = load_locked();
     if (j.contains(key) && j[key].is_boolean()) {
         return j[key].get<bool>();
     }
@@ -70,14 +109,14 @@ bool get_bool(const std::string& key, bool fallback) {
 
 void set_bool(const std::string& key, bool value) {
     std::lock_guard lock(g_mutex);
-    nlohmann::json j = load_locked();
+    nlohmann::json& j = load_locked();
     j[key] = value;
     save_locked(j);
 }
 
 int get_int(const std::string& key, int fallback) {
     std::lock_guard lock(g_mutex);
-    const nlohmann::json j = load_locked();
+    const nlohmann::json& j = load_locked();
     if (j.contains(key) && j[key].is_number_integer()) {
         return j[key].get<int>();
     }
@@ -86,14 +125,14 @@ int get_int(const std::string& key, int fallback) {
 
 void set_int(const std::string& key, int value) {
     std::lock_guard lock(g_mutex);
-    nlohmann::json j = load_locked();
+    nlohmann::json& j = load_locked();
     j[key] = value;
     save_locked(j);
 }
 
 std::string get_string(const std::string& key, const std::string& fallback) {
     std::lock_guard lock(g_mutex);
-    const nlohmann::json j = load_locked();
+    const nlohmann::json& j = load_locked();
     if (j.contains(key) && j[key].is_string()) {
         return j[key].get<std::string>();
     }
@@ -102,14 +141,14 @@ std::string get_string(const std::string& key, const std::string& fallback) {
 
 void set_string(const std::string& key, const std::string& value) {
     std::lock_guard lock(g_mutex);
-    nlohmann::json j = load_locked();
+    nlohmann::json& j = load_locked();
     j[key] = value;
     save_locked(j);
 }
 
 std::string get_json(const std::string& key, const std::string& fallback) {
     std::lock_guard lock(g_mutex);
-    const nlohmann::json j = load_locked();
+    const nlohmann::json& j = load_locked();
     if (!j.contains(key)) {
         return fallback;
     }
@@ -131,14 +170,14 @@ void set_json(const std::string& key, const std::string& value) {
     } catch (...) {
         return;
     }
-    nlohmann::json j = load_locked();
+    nlohmann::json& j = load_locked();
     j[key] = std::move(parsed);
     save_locked(j);
 }
 
 std::vector<std::string> get_string_array(const std::string& key) {
     std::lock_guard lock(g_mutex);
-    const nlohmann::json j = load_locked();
+    const nlohmann::json& j = load_locked();
     std::vector<std::string> out;
     if (j.contains(key) && j[key].is_array()) {
         for (const auto& item : j[key]) {
@@ -152,7 +191,7 @@ std::vector<std::string> get_string_array(const std::string& key) {
 
 void set_string_array(const std::string& key, const std::vector<std::string>& value) {
     std::lock_guard lock(g_mutex);
-    nlohmann::json j = load_locked();
+    nlohmann::json& j = load_locked();
     j[key] = value;
     save_locked(j);
 }

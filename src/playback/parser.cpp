@@ -620,6 +620,41 @@ vector<Note> GenshinSheetParser::translate_recorded(json song) {
     return result;
 }
 
+namespace {
+
+// Strict UTF-8 check (rejects overlongs, surrogates, and > U+10FFFF).
+bool is_valid_utf8(const string& text) {
+    size_t i = 0;
+    const size_t n = text.size();
+    while (i < n) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        size_t extra = 0;
+        uint32_t cp = 0;
+        if (c < 0x80) { ++i; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+        else return false;
+        for (size_t k = 1; k <= extra; ++k) {
+            if (i + k >= n) return false;
+            const unsigned char cc = static_cast<unsigned char>(text[i + k]);
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        static constexpr uint32_t kMin[4] = {0, 0x80, 0x800, 0x10000};
+        if (cp < kMin[extra] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+        i += extra + 1;
+    }
+    return true;
+}
+
+bool is_blank(const string& text) {
+    return all_of(text.begin(), text.end(),
+                  [](unsigned char c) { return isspace(c) || c == 0; });
+}
+
+}  // namespace
+
 vector<Note> GenshinSheetParser::translate_midi() {
     MidiData midi = parse_midi_file(file_path);
     metadata.type = Midi;
@@ -628,8 +663,13 @@ vector<Note> GenshinSheetParser::translate_midi() {
         build_tempo_segments(std::move(midi.tempos), midi.division);
     const uint32_t first_tempo = tempo_segments.front().microseconds_per_quarter;
     metadata.bpm = static_cast<int>(llround(60000000.0 / first_tempo));
+    // MIDI track names carry no encoding, and many exporters mangle non-Latin
+    // text (e.g. one byte per CJK character), so the bytes can't be decoded.
+    // When the embedded name isn't clean UTF-8, use the file name instead,
+    // which the filesystem always stores as proper UTF-8.
     metadata.title = midi.title;
-    if (metadata.title.empty()) {
+    if (metadata.title.empty() || is_blank(metadata.title) ||
+        !is_valid_utf8(metadata.title)) {
         metadata.title = filesystem::path(file_path).stem().string();
     }
     if (metadata.title.empty()) {

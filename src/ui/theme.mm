@@ -98,6 +98,49 @@ std::vector<Theme> make_all() {
         0.25,   // edge_tint    — brass filigree edge
     });
 
+    // Columbina — the Damselette. Reference: periwinkle moonlight, white
+    // feathered wings and her little dove-wing hair ornament, with violet-to-
+    // magenta hair. The accent is soft lilac moonlight over a deep night-blue
+    // ground; ink is cool white. Keys are full circles with a wide, gentle
+    // glow — moon and feathers, nothing sharp.
+    list.push_back(Theme{
+        "columbina", "Columbina (moonlit lilac)", "哥伦比娅（月光淡紫）",
+        srgb(0.76, 0.70, 1.00, 1.0),   // accent  (lilac moonlight)
+        srgb(0.76, 0.70, 1.00, 0.5),   // accent_dim
+        srgb(0.97, 0.97, 1.00, 1.0),   // ink     (cool white, feather)
+        srgb(0.95, 0.95, 1.00, 0.62),  // ink_soft
+        srgb(0.90, 0.90, 1.00, 0.32),  // ink_faint
+        srgb(0.06, 0.06, 0.17, 0.66),  // panel_tint (deep night blue-violet)
+        srgb(0.76, 0.70, 1.00, 0.26),  // border  (lilac hairline)
+        srgb(0.12, 0.08, 0.26, 1.0),   // on_accent (deep violet on lilac)
+        0.5,    // key_radius   — round, moonlike
+        9.0,    // glow_spread  — wide, soft moonglow
+        0.32,   // glow_strength
+        0.7,    // key_stroke   — light, feathered edge
+        0.30,   // edge_tint
+    });
+
+    // Skirk — reference: a starry void seen through shattered blue-violet
+    // glass, white hair, a crystal butterfly hairpin. The accent is icy
+    // violet-blue (the lit edge of a shard) over near-black indigo; ink is
+    // cold white. Keys are angular with a tight, sharp glow — glass, not moon.
+    list.push_back(Theme{
+        "skirk", "Skirk (shattered void)", "丝柯克（碎裂虚空）",
+        srgb(0.58, 0.64, 1.00, 1.0),   // accent  (icy violet-blue shard edge)
+        srgb(0.58, 0.64, 1.00, 0.5),   // accent_dim
+        srgb(0.96, 0.97, 1.00, 1.0),   // ink     (cold white)
+        srgb(0.93, 0.95, 1.00, 0.62),  // ink_soft
+        srgb(0.88, 0.91, 1.00, 0.32),  // ink_faint
+        srgb(0.03, 0.03, 0.10, 0.72),  // panel_tint (near-black indigo void)
+        srgb(0.58, 0.64, 1.00, 0.28),  // border  (shard-edge hairline)
+        srgb(0.04, 0.05, 0.16, 1.0),   // on_accent (void dark on ice)
+        0.10,   // key_radius   — angular, faceted
+        3.0,    // glow_spread  — tight, glinting
+        0.50,   // glow_strength
+        1.1,    // key_stroke   — crisp glass edge
+        0.35,   // edge_tint
+    });
+
     return list;
 }
 

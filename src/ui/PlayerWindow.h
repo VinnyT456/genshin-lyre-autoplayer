@@ -30,6 +30,8 @@ class PlaybackController;
 - (NSInteger)queueAddPaths:(NSArray<NSString*>*)paths;
 // Queue organization controls exposed by the playlist popup.
 - (BOOL)queueMoveCurrentBy:(NSInteger)offset;
+// Move any song to a new position (the current song keeps playing).
+- (BOOL)queueMoveIndex:(NSInteger)from to:(NSInteger)to;
 - (BOOL)queueRemoveIndex:(NSInteger)index;
 - (void)queueClear;
 - (BOOL)queueIsFavoriteAtIndex:(NSInteger)index;

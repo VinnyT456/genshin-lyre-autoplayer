@@ -17,6 +17,12 @@
 #include "keyboard.h"
 #include "key.h"
 #include "playback_controller.h"
+#include "key_calibration.h"
+#include "key_layout.h"
+#include "key_overlay.h"
+#include "settings_window.h"
+#include "song_library.h"
+#include "note_highway.h"
 #include "practice_dashboard.h"
 #include "settings.h"
 #include "strings.h"
@@ -24,7 +30,7 @@
 
 namespace {
 
-constexpr CGFloat kW = 260.0;
+constexpr CGFloat kW = 360.0;
 constexpr CGFloat kH = 252.0;       // expanded height
 constexpr CGFloat kMiniH = 62.0;    // collapsed: header only
 // Gap from game window edges (top-right dock).
@@ -41,6 +47,8 @@ constexpr const char* kSettingLockMastered = "practice_lock_until_mastered";
 constexpr const char* kSettingRampStart = "practice_ramp_start_pct";   // 0 = current speed
 constexpr const char* kSettingDifficulty = "practice_difficulty";      // 0 easy, 1 normal, 2 strict
 constexpr const char* kSettingShowSummary = "practice_show_summary";
+constexpr const char* kSettingShowHighway = "show_note_highway";
+constexpr const char* kSettingKeyOverlay = "practice_key_overlay";
 
 // Timing windows for each practice difficulty. Strict also caps chord
 // assembly so both keys of a chord must land close together.
@@ -863,6 +871,8 @@ static const char* kNames[3][7] = {
 @property(nonatomic, strong) NSMenu* menu_;      // items supplied by the owner
 @property(nonatomic) BOOL hovering;
 @property(nonatomic) BOOL expanded;
+// Click / Return opens this (the song library); right-click shows menu_.
+@property(nonatomic, copy) void (^onOpen)(void);
 @end
 
 @implementation SongPicker {
@@ -909,13 +919,25 @@ static const char* kNames[3][7] = {
     self.needsDisplay = YES;
 }
 
+- (void)open {
+    if (self.onOpen) {
+        self.onOpen();
+    } else {
+        [self openMenu];
+    }
+}
+
 - (void)mouseDown:(NSEvent*)event {
+    [self open];
+}
+
+- (void)rightMouseDown:(NSEvent*)event {
     [self openMenu];
 }
 
 - (void)keyDown:(NSEvent*)event {
     if (event.keyCode == 36 || event.keyCode == 49 || event.keyCode == 76) {
-        [self openMenu];
+        [self open];
         return;
     }
     [super keyDown:event];
@@ -1263,7 +1285,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
 @end
 
-@interface PlayerWindowController () <PanelMouseDelegate, NSWindowDelegate>
+@interface PlayerWindowController () <PanelMouseDelegate, NSWindowDelegate, SettingsWindowHost, SongLibraryHost>
 - (void)loadQueueIndex:(NSInteger)index
            sourceIndex:(NSInteger)sourceIndex
               autoplay:(BOOL)autoplay;
@@ -1273,6 +1295,15 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 - (void)setSpeedRamp:(NSMenuItem*)sender;
 - (void)setPracticeDifficulty:(NSMenuItem*)sender;
 - (void)toggleShowSummary:(id)sender;
+- (void)toggleNoteHighway:(id)sender;
+- (void)toggleKeyOverlay:(id)sender;
+- (void)toggleKeyPreview:(id)sender;
+- (void)calibrateKeys:(id)sender;
+- (void)adjustKeys:(id)sender;
+- (void)resetKeyCalibration:(id)sender;
+- (void)showSettingsWindow:(id)sender;
+- (void)showSongLibrary:(id)sender;
+- (void)showNoteHighway;
 - (PracticeDashboardController*)practiceDashboard;
 - (void)toggleUpcomingNote:(id)sender;
 - (void)toggleReducedMotion:(id)sender;
@@ -1327,6 +1358,16 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     NSTimer* _focusTimer;
     PracticeDashboardController* _practiceDashboard;
     BOOL _dashboardHiddenForBlur;  // dashboard was open when Genshin lost focus
+    NoteHighwayController* _highway;
+    KeyOverlayController* _keyOverlay;   // key highlights over the game window
+    BOOL _keyPreview;                    // outline all mapped keys (alignment check)
+    KeyCalibrationController* _calibration;   // non-nil while calibrating
+    SettingsWindowController* _settingsWindow;
+    SongLibraryWindowController* _songLibrary;
+    BOOL _libraryHiddenForBlur;
+    BOOL _settingsHiddenForBlur;
+    BOOL _highwayHiddenForBlur;    // highway was open when Genshin lost focus
+    BOOL _highwayPlaced;           // docked next to the HUD once
     id _hotkeyMonitor;
     CGFloat _target_alpha;
     pid_t _genshin_pid;
@@ -1482,17 +1523,25 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _titleLabel.textColor = ink();
     _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     _titleLabel.toolTip = title;
+    _titleLabel.usesSingleLineMode = YES;
 
     NSString* meta = bpm > 0 ? [NSString stringWithFormat:@"%ld BPM", (long)bpm] : @"Lyre";
     _metaLabel = [NSTextField labelWithString:meta];
     _metaLabel.font = [NSFont monospacedSystemFontOfSize:9.5 weight:NSFontWeightMedium];
     _metaLabel.textColor = ink_soft();
+    _metaLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _metaLabel.usesSingleLineMode = YES;
+    // Long song names / meta lines must shrink with "…", never widen the HUD.
+    for (NSTextField* label in @[_titleLabel, _metaLabel]) {
+        [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                        forOrientation:NSLayoutConstraintOrientationHorizontal];
+    }
 
     // Add-song button lives in the header chrome once a playlist exists.
     _addButton = [self chromeButton:@"plus" action:@selector(openSongs:)
                             tooltip:strings::get(Str::tip_add)];
     _addButton.hidden = YES;
-    _settingsButton = [self chromeButton:@"gearshape.fill" action:@selector(showSettingsMenu:)
+    _settingsButton = [self chromeButton:@"gearshape.fill" action:@selector(showSettingsWindow:)
                                  tooltip:strings::get(Str::tip_settings)];
     _collapseButton = [self chromeButton:@"chevron.up" action:@selector(toggleCollapse)
                                  tooltip:strings::get(Str::tip_collapse)];
@@ -1550,8 +1599,12 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self styleOpenButton];
 
     _songPicker = [[SongPicker alloc] initWithFrame:NSZeroRect];
-    _songPicker.toolTip = strings::get(Str::tip_playlist);
+    _songPicker.toolTip = strings::get(Str::library_tip_open);
     _songPicker.hidden = YES;
+    __weak PlayerWindowController* weakPicker = self;
+    _songPicker.onOpen = ^{
+        [weakPicker showSongLibrary:nil];
+    };
 
     _libraryRow = [NSStackView stackViewWithViews:@[_openButton, _songPicker]];
     _libraryRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
@@ -1662,6 +1715,9 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _hint.textColor = ink_faint();
     _hint.alignment = NSTextAlignmentCenter;
     _hint.lineBreakMode = NSLineBreakByTruncatingTail;
+    _hint.usesSingleLineMode = YES;
+    [_hint setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     NSStackView* expanded = [NSStackView stackViewWithViews:@[
         library_row, _key_grid, seek_row, transport_row, _hint]];
@@ -1688,6 +1744,8 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         [_content.leadingAnchor constraintEqualToAnchor:_panel.leadingAnchor constant:16],
         [_content.trailingAnchor constraintEqualToAnchor:_panel.trailingAnchor constant:-16],
         [_content.topAnchor constraintEqualToAnchor:_panel.topAnchor constant:15],
+        // Fixed HUD width: content truncates instead of stretching the window.
+        [_panel.widthAnchor constraintEqualToConstant:kW],
         [header.widthAnchor constraintEqualToAnchor:_content.widthAnchor],
         [rule.widthAnchor constraintEqualToAnchor:_content.widthAnchor],
         [expanded.widthAnchor constraintEqualToAnchor:_content.widthAnchor],
@@ -1998,6 +2056,97 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [self refresh];
 }
 
+- (void)toggleNoteHighway:(id)sender {
+    const BOOL showing = _highway.window.isVisible || _highwayHiddenForBlur;
+    settings::set_bool(kSettingShowHighway, !showing);
+    if (showing) {
+        _highwayHiddenForBlur = NO;
+        [_highway.window orderOut:nil];
+    } else {
+        [self showNoteHighway];
+    }
+}
+
+- (void)showNoteHighway {
+    if (_highway == nil) {
+        _highway = [[NoteHighwayController alloc] initWithPlayback:_playback];
+        // The close button turns the setting off, same as the menu toggle.
+        __weak PlayerWindowController* weakSelf = self;
+        [NSNotificationCenter.defaultCenter
+            addObserverForName:NSWindowWillCloseNotification
+                        object:_highway.window
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification* note) {
+            PlayerWindowController* strongSelf = weakSelf;
+            if (strongSelf != nil && !strongSelf->_highwayHiddenForBlur) {
+                settings::set_bool(kSettingShowHighway, false);
+            }
+        }];
+    }
+    if (!_highwayPlaced) {
+        // Dock to the left of the HUD, top edges aligned, kept on screen.
+        _highwayPlaced = YES;
+        const NSRect hud = self.window.frame;
+        NSRect frame = _highway.window.frame;
+        const NSRect visible = (self.window.screen ?: NSScreen.mainScreen).visibleFrame;
+        frame.origin.x = std::max(NSMinX(visible) + 8.0, NSMinX(hud) - NSWidth(frame) - 12.0);
+        frame.origin.y = std::max(NSMinY(visible) + 8.0, NSMaxY(hud) - NSHeight(frame));
+        [_highway.window setFrame:frame display:NO];
+    }
+    [_highway showWindow:self];
+    [_highway.window orderFrontRegardless];
+}
+
+- (void)toggleKeyOverlay:(id)sender {
+    settings::set_bool(kSettingKeyOverlay, !settings::get_bool(kSettingKeyOverlay, true));
+    [self updateFocusAppearance];
+}
+
+- (void)toggleKeyPreview:(id)sender {
+    _keyPreview = !_keyPreview;
+    [self updateFocusAppearance];
+}
+
+// Two-click calibration over the Genshin window (see key_calibration.h).
+- (void)calibrateKeys:(id)sender {
+    [self beginCalibrationAdjusting:NO];
+}
+
+// Fine-tune the current layout key by key, skipping the Q/M clicks.
+- (void)adjustKeys:(id)sender {
+    [self beginCalibrationAdjusting:YES];
+}
+
+- (void)beginCalibrationAdjusting:(BOOL)adjust {
+    const pid_t pid = genshin_pid();
+    const std::optional<NSRect> frame = pid != 0 ? game_frame(pid, nullptr) : std::nullopt;
+    if (!frame.has_value()) {
+        [self flashHint:strings::get(Str::calib_need_genshin)];
+        return;
+    }
+    [_key_grid releaseHeldKey];
+    [_settingsWindow.window orderOut:nil];   // keep the game unobstructed
+    _calibration = [[KeyCalibrationController alloc] init];
+    __weak PlayerWindowController* weakSelf = self;
+    [_calibration beginOverGameFrame:*frame adjusting:adjust completion:^(BOOL saved) {
+        PlayerWindowController* strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        strongSelf->_calibration = nil;
+        if (saved) {
+            [strongSelf flashHint:strings::get(Str::calib_done)];
+        }
+        [strongSelf updateFocusAppearance];
+        [strongSelf->_settingsWindow reload];
+        [strongSelf->_settingsWindow showWindow:nil];
+    }];
+    [self updateFocusAppearance];
+}
+
+- (void)resetKeyCalibration:(id)sender {
+    clear_key_calibration();
+    [self updateFocusAppearance];
+}
+
 - (void)toggleShowSummary:(id)sender {
     settings::set_bool(kSettingShowSummary, !settings::get_bool(kSettingShowSummary, true));
 }
@@ -2210,6 +2359,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     lockMastered.enabled = _playback->practice_mode();
     [practiceMenu addItem:lockMastered];
 
+
     NSMenuItem* upcoming = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_show_upcoming)
                action:@selector(toggleUpcomingNote:)
@@ -2263,6 +2413,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
                action:_drill.empty() ? @selector(startDrill:) : @selector(stopDrill:)
         keyEquivalent:@""];
     drill.target = self;
+    drill.identifier = kSettingsActionIdentifier;
     drill.enabled = self.queueDelegate != nil && [self.queueDelegate queueCount] > 0;
     [practiceMenu addItem:drill];
 
@@ -2271,6 +2422,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
                action:@selector(restartPracticePhrase:)
         keyEquivalent:@""];
     restartPhrase.target = self;
+    restartPhrase.identifier = kSettingsActionIdentifier;
     restartPhrase.enabled = _playback->practice_mode();
     [practiceMenu addItem:restartPhrase];
 
@@ -2289,11 +2441,69 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
                action:@selector(showPracticeDashboard:)
         keyEquivalent:@""];
     insights.target = self;
+    insights.identifier = kSettingsActionIdentifier;
     insights.enabled = _playback->practice_mode();
     [practiceMenu addItem:insights];
 
     practiceItem.submenu = practiceMenu;
+    practiceItem.image = [NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil];
     [menu addItem:practiceItem];
+
+    // Key highlights over the game lyre: overlay, alignment preview, calibration.
+    NSMenuItem* keysItem = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_key_section) action:nil keyEquivalent:@""];
+    NSMenu* keysMenu = [[NSMenu alloc] initWithTitle:keysItem.title];
+    const KeyLayout& layout = current_key_layout();
+    NSMenuItem* overlay = [[NSMenuItem alloc]
+        initWithTitle:strings::get(layout.ready ? Str::menu_key_overlay : Str::menu_key_overlay_unset)
+               action:@selector(toggleKeyOverlay:)
+        keyEquivalent:@""];
+    overlay.target = self;
+    overlay.state = layout.ready && settings::get_bool(kSettingKeyOverlay, true)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    overlay.enabled = layout.ready;
+    [keysMenu addItem:overlay];
+    NSMenuItem* preview = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_key_preview)
+               action:@selector(toggleKeyPreview:)
+        keyEquivalent:@""];
+    preview.target = self;
+    preview.state = _keyPreview ? NSControlStateValueOn : NSControlStateValueOff;
+    preview.enabled = layout.ready;
+    [keysMenu addItem:preview];
+    [keysMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* calibrate = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_calibrate)
+               action:@selector(calibrateKeys:)
+        keyEquivalent:@""];
+    calibrate.target = self;
+    calibrate.identifier = kSettingsActionIdentifier;
+    [keysMenu addItem:calibrate];
+    NSMenuItem* adjustKeys = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_adjust_keys)
+               action:@selector(adjustKeys:)
+        keyEquivalent:@""];
+    adjustKeys.target = self;
+    adjustKeys.identifier = kSettingsActionIdentifier;
+    adjustKeys.enabled = layout.ready;
+    [keysMenu addItem:adjustKeys];
+    NSMenuItem* resetCalibration = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_reset_calibration)
+               action:@selector(resetKeyCalibration:)
+        keyEquivalent:@""];
+    resetCalibration.target = self;
+    resetCalibration.identifier = kSettingsActionIdentifier;
+    resetCalibration.enabled = layout.calibrated;
+    [keysMenu addItem:resetCalibration];
+    NSMenuItem* calibrationNote = [[NSMenuItem alloc]
+        initWithTitle:strings::get(layout.calibrated ? Str::calib_status_custom
+                                                     : Str::calib_status_default)
+               action:nil keyEquivalent:@""];
+    calibrationNote.enabled = NO;
+    [keysMenu addItem:calibrationNote];
+    keysItem.submenu = keysMenu;
+    keysItem.image = [NSImage imageWithSystemSymbolName:@"circle.grid.3x3.fill" accessibilityDescription:nil];
+    [menu addItem:keysItem];
 
     NSMenuItem* playbackItem = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_playback) action:nil keyEquivalent:@""];
@@ -2317,14 +2527,19 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     [playbackMenu addItem:ap];
 
     reset.target = self;
+    reset.identifier = kSettingsActionIdentifier;
     [playbackMenu addItem:reset];
+
+    // Note highway (falling notes) is shelved for now: the view and its
+    // toggleNoteHighway: handler remain, but no menu entry exposes it.
     playbackItem.submenu = playbackMenu;
+    playbackItem.image = [NSImage imageWithSystemSymbolName:@"play.circle" accessibilityDescription:nil];
     [menu addItem:playbackItem];
 
-    NSMenuItem* accessibilityItem = [[NSMenuItem alloc]
-        initWithTitle:strings::get(Str::menu_accessibility) action:nil keyEquivalent:@""];
+    NSMenuItem* appearanceItem = [[NSMenuItem alloc]
+        initWithTitle:strings::get(Str::menu_appearance) action:nil keyEquivalent:@""];
     NSMenu* accessibilityMenu =
-        [[NSMenu alloc] initWithTitle:accessibilityItem.title];
+        [[NSMenu alloc] initWithTitle:appearanceItem.title];
     NSMenuItem* motion = [[NSMenuItem alloc]
         initWithTitle:strings::get(Str::menu_reduced_motion)
                action:@selector(toggleReducedMotion:) keyEquivalent:@""];
@@ -2338,10 +2553,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     highContrast.state = _highContrast
         ? NSControlStateValueOn : NSControlStateValueOff;
     [accessibilityMenu addItem:highContrast];
-    accessibilityItem.submenu = accessibilityMenu;
-    [menu addItem:accessibilityItem];
-
-    [menu addItem:[NSMenuItem separatorItem]];
+    [accessibilityMenu addItem:[NSMenuItem separatorItem]];
 
     // Theme submenu — one item per registered theme, current one checked.
     NSMenuItem* themeItem = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_theme)
@@ -2360,7 +2572,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
         [themeMenu addItem:it];
     }
     themeItem.submenu = themeMenu;
-    [menu addItem:themeItem];
+    [accessibilityMenu addItem:themeItem];
 
     // Language submenu.
     NSMenuItem* langItem = [[NSMenuItem alloc] initWithTitle:strings::get(Str::menu_language)
@@ -2378,32 +2590,68 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     cn.state = zh ? NSControlStateValueOn : NSControlStateValueOff;
     [langMenu addItem:cn];
     langItem.submenu = langMenu;
-    [menu addItem:langItem];
+    [accessibilityMenu addItem:langItem];
+    appearanceItem.submenu = accessibilityMenu;
+    appearanceItem.image = [NSImage imageWithSystemSymbolName:@"paintpalette" accessibilityDescription:nil];
+    [menu addItem:appearanceItem];
 
     return menu;
+}
+
+// SettingsWindowHost: the settings window renders this same menu as pages.
+- (NSMenu*)settingsMenu {
+    return [self panelContextMenu];
+}
+
+- (void)showSongLibrary:(id)sender {
+    [_key_grid releaseHeldKey];
+    if (_songLibrary == nil) {
+        _songLibrary = [[SongLibraryWindowController alloc] initWithHost:self];   // builds once
+        [_songLibrary.window center];
+    } else {
+        [_songLibrary reload];
+    }
+    [_songLibrary showWindow:self];
+    [_songLibrary.window orderFrontRegardless];
+}
+
+// SongLibraryHost.
+- (void)libraryLoadSong:(NSInteger)index source:(NSInteger)source {
+    [self loadQueueIndex:index sourceIndex:source autoplay:NO];
+}
+
+- (void)libraryRemoveSong:(NSInteger)index {
+    [self removeSongAtIndex:index];
+}
+
+- (void)libraryClearSongs {
+    [self clearQueue:nil];
+}
+
+- (void)libraryAddSongs {
+    [self openSongs:nil];
+}
+
+- (void)libraryQueueChanged {
+    [self reloadQueuePicker];
+    [self reloadQueueMetadata];
+    [self refresh];
+}
+
+- (void)showSettingsWindow:(id)sender {
+    [_key_grid releaseHeldKey];
+    if (_settingsWindow == nil) {
+        _settingsWindow = [[SettingsWindowController alloc] initWithHost:self];
+        [_settingsWindow.window center];
+    }
+    [_settingsWindow reload];
+    [_settingsWindow showWindow:self];
+    [_settingsWindow.window orderFrontRegardless];
 }
 
 - (void)resetSpeed:(id)sender {
     _playback->set_speed(1.0);
     [self refresh];
-}
-
-// Gear button — pops the same menu the right-click gesture shows, anchored
-// just under the button.
-- (void)showSettingsMenu:(id)sender {
-    // A grid click posts key-down immediately and normally releases it on the
-    // matching mouse-up. Opening a menu can move that mouse-up into AppKit's
-    // menu tracking loop, so release defensively before changing focus.
-    [_key_grid releaseHeldKey];
-    NSButton* button = _settingsButton;
-    NSMenu* menu = [self panelContextMenu];
-    const NSPoint origin = NSMakePoint(0, NSHeight(button.bounds) + 4);
-    [menu popUpMenuPositioningItem:nil atLocation:origin inView:button];
-    // Return keyboard note input to the grid after the menu is dismissed, but
-    // do not steal focus from another window opened by a menu action.
-    if (self.window.isKeyWindow) {
-        [self.window makeFirstResponder:_key_grid];
-    }
 }
 
 - (void)selectTheme:(NSMenuItem*)sender {
@@ -2424,6 +2672,8 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     strings::set_current([code isEqualToString:@"zh"] ? Lang::chinese : Lang::english);
     settings::set_string(kSettingLang, code.UTF8String);
     [self applyLocalization];
+    [_highway reloadStrings];
+    [_settingsWindow reload];
 }
 
 // Keep the empty-state CTA's title, icon, tooltip, and accessibility metadata
@@ -2471,6 +2721,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _miniProgress.needsDisplay = YES;
     [_statusPill setNeedsDisplay:YES];
     [self reloadQueuePicker];  // re-colors the popup's item titles
+    [_songLibrary reload];
     [self refresh];  // re-applies accent-driven button glyphs + status
 }
 
@@ -2482,7 +2733,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     _hideButton.toolTip = strings::get(Str::tip_close);
     [self styleOpenButton];
     _openButton.toolTip = strings::get(Str::open_button_help);
-    _songPicker.toolTip = strings::get(Str::tip_playlist);
+    _songPicker.toolTip = strings::get(Str::library_tip_open);
     _prevButton.toolTip = strings::get(Str::tip_previous);
     _loopButton.toolTip = strings::get(Str::tip_loop);
     _playPause.toolTip = strings::get(Str::tip_playpause);
@@ -2739,17 +2990,23 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
 
 - (void)removeSongFromQueue:(NSMenuItem*)sender {
     NSDictionary* selection = sender.representedObject;
+    if (selection != nil) {
+        [self removeSongAtIndex:[selection[@"songIndex"] integerValue]];
+    }
+}
+
+- (void)removeSongAtIndex:(NSInteger)index {
     id<PlayerQueueDelegate> q = self.queueDelegate;
-    if (q == nil || selection == nil) {
+    if (q == nil) {
         return;
     }
-    const NSInteger index = [selection[@"songIndex"] integerValue];
     NSAlert* alert = [[NSAlert alloc] init];
     alert.messageText = [NSString stringWithFormat:@"Remove “%@” from the queue?",
         [q queueTitleAtIndex:index] ?: @""];
     alert.informativeText = @"The file will not be deleted.";
     [alert addButtonWithTitle:@"Remove"];
     [alert addButtonWithTitle:@"Cancel"];
+    alert.window.level = NSScreenSaverWindowLevel + 1;
     if ([alert runModal] != NSAlertFirstButtonReturn) {
         return;
     }
@@ -2770,6 +3027,7 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
     alert.informativeText = @"The files will not be deleted.";
     [alert addButtonWithTitle:@"Clear"];
     [alert addButtonWithTitle:@"Cancel"];
+    alert.window.level = NSScreenSaverWindowLevel + 1;
     if ([alert runModal] != NSAlertFirstButtonReturn) {
         return;
     }
@@ -3212,11 +3470,49 @@ typedef NS_ENUM(NSInteger, GlyphButtonStyle) {
             [dashboard orderOut:nil];
             _dashboardHiddenForBlur = YES;
         }
+        if (_highway.window.isVisible) {
+            _highwayHiddenForBlur = YES;
+            [_highway.window orderOut:nil];
+        }
+        if (_settingsWindow.window.isVisible) {
+            _settingsHiddenForBlur = YES;
+            [_settingsWindow.window orderOut:nil];
+        }
+        if (_songLibrary.window.isVisible) {
+            _libraryHiddenForBlur = YES;
+            [_songLibrary.window orderOut:nil];
+        }
+        [_keyOverlay updateWithGameFrame:NSZeroRect visible:NO];
         return;
     }
+
+    // Lyre key highlights: only during a practice run, only while Genshin
+    // itself is frontmost (not our file picker / dashboard), once mapped.
+    const BOOL practicing = _playback->practice_mode() &&
+        playbackState != PlaybackState::stopped &&
+        settings::get_bool(kSettingKeyOverlay, true);
+    const BOOL overlayWanted = _calibration == nil && focused && game.has_value() &&
+        key_overlay_map_ready() && (practicing || _keyPreview);
+    if (overlayWanted && _keyOverlay == nil) {
+        _keyOverlay = [[KeyOverlayController alloc] initWithPlayback:_playback];
+    }
+    _keyOverlay.preview = _keyPreview;
+    [_keyOverlay updateWithGameFrame:game.value_or(NSZeroRect) visible:overlayWanted];
     if (_dashboardHiddenForBlur) {
         _dashboardHiddenForBlur = NO;
         [dashboard orderFrontRegardless];
+    }
+    if (_highwayHiddenForBlur) {
+        _highwayHiddenForBlur = NO;
+        [_highway.window orderFrontRegardless];
+    }
+    if (_settingsHiddenForBlur) {
+        _settingsHiddenForBlur = NO;
+        [_settingsWindow.window orderFrontRegardless];
+    }
+    if (_libraryHiddenForBlur) {
+        _libraryHiddenForBlur = NO;
+        [_songLibrary.window orderFrontRegardless];
     }
 
     // Follow the current game window position (keeping the user's dragged

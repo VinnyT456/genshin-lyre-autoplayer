@@ -37,9 +37,10 @@ If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo
 ## What it does
 
 - **Docks to Genshin.** Starts at the game window's top-right and follows it as it moves; drag it anywhere and it keeps your spot. Hides when Genshin isn't frontmost.
-- **Plays songs for you.** Open one or many `.genshinsheet`, `.mid`, or `.midi` files (or a folder) as a playlist. Matching sheet and MIDI files in the same folder are grouped as one song, with the alternate source available from the song picker. Play / pause / stop, seek, loop, and change speed.
+- **Plays songs for you.** Open one or many `.genshinsheet`, `.mid`, or `.midi` files (or a folder) as a playlist. Matching sheet and MIDI files in the same folder are grouped as one song, with the alternate version selectable in the [song library](#song-library). Play / pause / stop, seek, loop, and change speed.
 - **Shows what it's doing.** The 21-key lyre grid lights up in real time; a progress bar and a pulsing status dot track playback.
 - **Helps you learn.** Learn mode breaks a song into phrase-sized groups, highlights the expected note or chord, and advances only when you play it from the keyboard or HUD, without automatic playback. Turn on **Practice at song speed** to follow the song's timestamps with early, late, and missed-note feedback. A phrase is **mastered** after three clean runs in a row. See [Practice mode](#practice-mode) for everything it can do. Loop always repeats the currently loaded song.
+- **Highlights keys on the game's lyre.** During practice, the next key glows right on Genshin's own lyre, styled to the HUD theme — solid while Learn mode waits for you, fading out over the timing window at song speed. Calibrate once by clicking Q and M.
 - **Plays by hand too.** Click keys on the HUD grid to send that note to Genshin yourself.
 - **Feels human.** Variable key-hold and chord stagger, a 3-second count-in before it starts, and auto-advance to the next song.
 - **Stays targeted.** Keystrokes are posted only to the Genshin process (`CGEventPostToPid`) — nothing is injected into the game.
@@ -47,7 +48,7 @@ If the video doesn't play inline, download <a href="assets/demo.mp4">assets/demo
 
 ## Practice mode
 
-Learn mode turns the HUD into a lyre teacher. Everything below lives in the gear menu's **Practice** section.
+Learn mode turns the HUD into a lyre teacher. Everything below lives on the **Practice** page of the Settings window (gear button).
 
 **Drilling**
 - **Loop phrase until mastered** — a phrase repeats in place until you play it cleanly three times in a row, then moves on.
@@ -68,6 +69,26 @@ Learn mode turns the HUD into a lyre teacher. Everything below lives in the gear
   - a **phrase heatmap** colored by accuracy, with dashed lines marking your best from before this session so you can see yourself beat it.
 
 Each press of play after a stop starts a new session; history (bests, per-phrase bests, and the session log) is saved locally per song title, even if Insights is never opened.
+
+## Song library
+
+Click the song name on the HUD to open the **Song library**, a themed window laid out like Settings:
+
+- **All songs / Favorites / Recently played** in the sidebar, with **Open songs…** and **Clear playlist** underneath.
+- **Search** filters by title as you type (case- and accent-insensitive, works with Chinese and Japanese titles).
+- Each row shows the song's position, title, file type, BPM, and how many versions it has; the current song is highlighted. Click a row to load it.
+- Hover a row for its controls: **★** favorite, **⌃ / ⌄** move it up or down the playlist (All songs, unfiltered), and **×** remove it (asks first; files are never deleted). Songs with both a `.genshinsheet` and a `.mid` get a version picker.
+
+Right-click the song name for the quick playlist menu instead.
+
+## Key highlights
+
+With **Key highlights** on (Settings → Key highlights), practice runs light up the expected key on Genshin's lyre itself. Each HUD theme has its own highlight design.
+
+- **Calibrate keys…** — click the center of Q, then M; all 21 positions are derived and shown for review. Before saving you can fix any key on its own: **drag** a ring to move it, **scroll** over it (or press **+ / −**) to resize, and use the **arrow keys** to nudge the selected key by 1 pt (**⇧** for 10 pt); **Tab** steps through keys. Enter saves, R redoes, Esc cancels. Calibration is stored as fractions of the game picture, so it survives moving or resizing the window.
+- **Adjust keys…** — open the current layout straight in that review step to fine-tune individual keys without redoing the Q / M clicks.
+- **Preview key positions** — rings and letters on every key to check alignment.
+- **Reset key calibration** — return to the built-in map (measured on a 16:10 windowed game).
 
 ## Background input
 
@@ -130,13 +151,15 @@ Import it in PlayCover's keymapping for Genshin, then equip the lyre in-game.
 | Reduce motion (settings menu) | Disable HUD shimmer, pulsing, and collapse animations |
 | High contrast (Accessibility menu) | Strengthen key borders and labels without changing the active theme |
 | Practice Insights (Practice menu) | Grade, accuracy vs. best, streak, timing histogram, progress chart, and a clickable phrase heatmap |
-| Playlist menu | Reorder, favorite, remove, clear, reopen recent songs, or show favorites only |
+| Song name (click) | Open the song library: browse, search, favorite, reorder, remove, and pick versions |
+| Song name (right-click) | Quick playlist menu: reorder, favorite, remove, clear, recent songs, favorites only |
 | Restart phrase (Practice menu / `⌘↩`) | Return to the beginning of the current inferred phrase |
 | `+` (header) | Add more songs to the playlist |
 | Chevron | Collapse to a mini bar |
 | `×` | Hide the HUD and stop |
 | Drag the HUD | Move it anywhere; it starts docked top-right and keeps your spot as the game window moves |
-| Right-click HUD | Open grouped Practice, Playback, and Accessibility settings, including Play in Background |
+| Gear (header) | Open the Settings window: Practice, Key highlights, Playback, and Appearance pages |
+| Right-click HUD | The same settings as a quick menu |
 
 **Global hotkeys** (while Genshin is focused): `⌘⌥Space` play/pause · `⌘⌥.` stop · `⌘⌥L` loop · `⌘⌥H` raise HUD.
 
@@ -177,12 +200,16 @@ The parser accepts **[Specy's Genshin Music](https://specy.github.io/genshinMusi
 
 ## How it works
 
-- **PlayerWindow** (`src/PlayerWindow.mm`) — the HUD: a borderless `NSPanel` at screen-saver window level, custom-drawn lyre grid / seek bar / status dot, window-follow and focus logic.
-- **PlaybackController** (`src/playback_controller.cpp`) — a worker thread that fires notes on schedule; handles play/pause/stop, seek, loop, speed, and count-in.
-- **parser** (`src/parser.cpp`) — `.genshinsheet` / MIDI → timed `Note`s.
-- **keyboard** (`src/keyboard.mm`) — posts `CGEvent` key presses to the Genshin pid, with human-like jitter.
-- **genshin** (`src/genshin.mm`) — locates and focuses the Genshin process.
-- **settings** (`src/settings.cpp`) — reads/writes the local `hud-settings.json`.
+- **PlayerWindow** (`src/ui/PlayerWindow.mm`) — the HUD: a borderless `NSPanel` at screen-saver window level, custom-drawn lyre grid / seek bar / status dot, window-follow and focus logic.
+- **Settings window** (`src/ui/settings_window.mm`) — themed pages rendered from the HUD's settings menu, so both always match.
+- **Song library** (`src/ui/song_library.mm`) — the themed playlist browser.
+- **Key overlay** (`src/ui/key_overlay.mm`, `key_layout.mm`, `key_calibration.mm`) — click-through highlights over the game window, per-theme designs, and click-to-calibrate.
+- **Practice Insights** (`src/ui/practice_dashboard.mm`) — grade, timing, progress, and phrase heatmap.
+- **PlaybackController** (`src/playback/playback_controller.cpp`) — a worker thread that fires notes on schedule; handles play/pause/stop, seek, loop, speed, count-in, and practice scoring.
+- **parser** (`src/playback/parser.cpp`) — `.genshinsheet` / MIDI → timed `Note`s.
+- **keyboard** (`src/app/keyboard.mm`) — posts `CGEvent` key presses to the Genshin pid, with human-like jitter.
+- **genshin** (`src/app/genshin.mm`) — locates and focuses the Genshin process.
+- **settings** (`src/app/settings.cpp`) — reads/writes the local `hud-settings.json`.
 
 ## Status
 

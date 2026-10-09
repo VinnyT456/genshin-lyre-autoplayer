@@ -531,6 +531,7 @@ void PlaybackController::set_notes(std::vector<Note> notes) {
     stop();
     std::lock_guard lock(mutex_);
     notes_ = std::move(notes);
+    ++notes_revision_;
     practice_pinned_phrase_ = kNoPhrase;
     rebuild_practice_phrases_locked();
     reset_practice_stats_locked();
@@ -868,6 +869,45 @@ std::chrono::milliseconds PlaybackController::practice_tempo_elapsed_locked() co
         return duration_locked();
     }
     return std::chrono::milliseconds(0);
+}
+
+HighwayClock PlaybackController::highway_clock() const {
+    std::lock_guard lock(mutex_);
+    HighwayClock clock;
+    clock.state = state_;
+    clock.practice = practice_mode_;
+    clock.tempo = practice_tempo_;
+    clock.practice_index = practice_index_;
+    clock.speed = speed_;
+    clock.notes_revision = notes_revision_;
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto song_since_origin = [&] {
+        return std::chrono::duration<double, std::milli>(now - origin_).count() * speed_;
+    };
+    if (practice_mode_ && !practice_tempo_) {
+        clock.song_ms = practice_index_ < notes_.size()
+            ? static_cast<double>(notes_[practice_index_].timestamp.count())
+            : static_cast<double>(duration_locked().count());
+    } else if (practice_mode_ &&
+               (state_ == PlaybackState::playing || state_ == PlaybackState::countdown)) {
+        // Song-speed practice anchors origin_ ahead of the count-in, so this is
+        // naturally negative until the first note is due.
+        clock.song_ms = song_since_origin();
+    } else if (state_ == PlaybackState::playing) {
+        clock.song_ms = song_since_origin();
+    } else if (state_ == PlaybackState::countdown) {
+        // Autoplay: song time 0 starts when the count-in ends.
+        clock.song_ms = -std::chrono::duration<double, std::milli>(countdown_end_ - now).count() * speed_;
+    } else {
+        clock.song_ms = static_cast<double>(elapsed_locked().count());
+    }
+    return clock;
+}
+
+std::vector<Note> PlaybackController::notes() const {
+    std::lock_guard lock(mutex_);
+    return notes_;
 }
 
 PlaybackSnapshot PlaybackController::snapshot() const {
